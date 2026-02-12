@@ -34,17 +34,16 @@
 ## 一键使用
 
 ### 方式 A：curl 直接运行（推荐）
-把下面地址改成你仓库里的脚本 raw 链接（文件名以你仓库实际为准）：
 
-```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/<YOUR_GITHUB>/<YOUR_REPO>/main/emby-proxy-toolbox.sh)"
+```
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/bear4f/emby-proxy-toolbox/main/emby-proxy-toolbox.sh)"
 ````
 
 ### 方式 B：下载后本地运行
 
 ```bash
 curl -fsSL -o emby-proxy-toolbox.sh \
-  https://raw.githubusercontent.com/<YOUR_GITHUB>/<YOUR_REPO>/main/emby-proxy-toolbox.sh
+  https://raw.githubusercontent.com/bear4f/emby-proxy-toolbox/main/emby-proxy-toolbox.sh
 
 chmod +x emby-proxy-toolbox.sh
 sudo ./emby-proxy-toolbox.sh
