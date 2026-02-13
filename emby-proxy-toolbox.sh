@@ -24,6 +24,32 @@ TOOL_NAME="emby-proxy-toolbox"
 need_root() { [[ "${EUID}" -eq 0 ]] || { echo "请用 root 运行：sudo bash $0"; exit 1; }; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+
+backup_copy() {
+  # backup_copy <src_path> [tag]
+  # Always back up to "<base>.bak.<tag>.<ts>" where <base> strips any existing ".bak*"
+  local src="$1"
+  local tag="${2:-bak}"
+  local ts base dst
+
+  [[ -f "$src" || -L "$src" ]] || return 0
+
+  ts="$(date +%F_%H%M%S)"
+
+  # Strip anything from the first ".bak" onwards to avoid filename stacking
+  base="${src%%.bak*}"
+  [[ -z "$base" ]] && base="$src"
+
+  dst="${base}.bak.${tag}.${ts}"
+
+  # If dst already exists (rare), append a random suffix
+  if [[ -e "$dst" ]]; then
+    dst="${dst}.$RANDOM"
+  fi
+
+  cp -a "$src" "$dst"
+}
+
 prompt() {
   local __var="$1" __msg="$2" __def="${3:-}"
   local input=""
@@ -110,7 +136,7 @@ ensure_sites_enabled_include() {
   [[ -f "$main" ]] || return 0
   grep -qE 'include\s+/etc/nginx/sites-enabled/\*;' "$main" && return 0
 
-  cp -a "$main" "${main}.bak.$(date +%F_%H%M%S)"
+  backup_copy "$main" "ensure_include"
   if grep -qE 'include\s+/etc/nginx/conf\.d/\*\.conf;' "$main"; then
     sed -i '/include\s\+\/etc\/nginx\/conf\.d\/\*\.conf;/a\    include /etc/nginx/sites-enabled/*;' "$main"
   else
@@ -131,7 +157,7 @@ nginx_self_heal_compat() {
   if [[ -n "$http3_files" ]]; then
     while read -r f; do
       [[ -z "$f" ]] && continue
-      cp -a "$f" "${f}.bak.${ts}"
+      backup_copy "$f" "compat"
       sed -i '/\$http3\b/s/^/# /' "$f"
     done <<< "$http3_files"
     changed="y"
@@ -139,7 +165,7 @@ nginx_self_heal_compat() {
 
   # 注释 quic/http3/ssl_reject_handshake
   if grep -qiE '\b(quic_bpf|http3|ssl_reject_handshake)\b' "$main"; then
-    cp -a "$main" "${main}.bak.${ts}"
+    backup_copy "$main" "compat"
     sed -i -E '
       s/^\s*quic_bpf\b/# quic_bpf/;
       s/^\s*http3\b/# http3/;
@@ -162,7 +188,7 @@ nginx_self_heal_compat() {
       }
       END{exit 0;}
     ' "$main"; then
-      cp -a "$main" "${main}.bak.${ts}"
+      backup_copy "$main" "auto"
       awk '
         BEGIN{state=0;lvl=0;match=0;}
         {
