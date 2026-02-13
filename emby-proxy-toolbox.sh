@@ -7,6 +7,7 @@ set -euo pipefail
 SITES_AVAIL="/etc/nginx/sites-available"
 SITES_ENAB="/etc/nginx/sites-enabled"
 BACKUP_ROOT="/root"
+BACKUP_KEEP=2  # 保留最近多少份 nginx-backup 目录
 
 # 单站管理器
 SINGLE_PREFIX="emby-"
@@ -106,6 +107,8 @@ backup_nginx() {
   dir="${BACKUP_ROOT}/nginx-backup-${ts}"
   mkdir -p "$dir/nginx"
   rsync -a /etc/nginx/ "$dir/nginx/"
+  prune_nginx_backups
+
   echo "$dir"
 }
 restore_nginx() { local dir="$1"; rsync -a --delete "$dir/nginx/" /etc/nginx/; }
@@ -129,6 +132,28 @@ apply_with_rollback() {
     return 1
   fi
   reload_nginx
+}
+
+prune_nginx_backups() {
+  # 保留最近 ${BACKUP_KEEP} 份 /root/nginx-backup-YYYYmmdd_HHMMSS 目录，自动清理更早的备份
+  local keep="${BACKUP_KEEP:-2}"
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep=2
+  (( keep < 1 )) && keep=1
+
+  # 只匹配目录，按时间倒序
+  local d
+  mapfile -t _bk_dirs < <(ls -1dt "${BACKUP_ROOT}"/nginx-backup-* 2>/dev/null | while read -r d; do [[ -d "$d" ]] && echo "$d"; done)
+
+  local total="${#_bk_dirs[@]}"
+  (( total <= keep )) && return 0
+
+  local i
+  for ((i=keep; i<total; i++)); do
+    d="${_bk_dirs[$i]}"
+    # 双重保险：只删符合前缀的目录
+    [[ -n "$d" && "$d" == "${BACKUP_ROOT}/nginx-backup-"* && -d "$d" ]] || continue
+    rm -rf -- "$d" 2>/dev/null || true
+  done
 }
 
 ensure_sites_enabled_include() {
