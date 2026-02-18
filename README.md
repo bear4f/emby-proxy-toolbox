@@ -1,14 +1,4 @@
-要改，而且你这版 README 里**还残留了一个“真实域名”**（`bear4f/emby-proxy-toolbox` 这个仓库名没问题，但正文里出现了 `https://raw.githubusercontent.com/bear4f/...` 这种属于你的公开信息；如果你不介意公开仓库名当然没问题）。另外你在“通用网关”示例里已经用 `example.com` / `203.0.113.10`，这部分很安全 👍
 
-我建议做三类修改：**示例统一去真实信息、补上“HTTPS/HTTP 判别规则”、以及把 Cloudflare 端口提示改成“引用官方”但不写死列表**（避免过期）。
-
-下面是我给你的一份“可直接覆盖 README.md”的最终版（中文、示例安全、同时把你刚验证出来的 `/http/` 用法强调清楚）。你直接复制到 GitHub 覆盖即可。
-
----
-
-## README.md（最终版，安全示例已替换）
-
-````markdown
 # Emby Proxy Toolbox（单站反代 + 通用反代网关，一体化脚本）
 
 一个菜单式脚本，用于在 VPS 上部署 **Nginx 反向代理**，让 Emby / Jellyfin 等媒体访问 **走你的 VPS 出口**。
