@@ -1,3 +1,14 @@
+要改，而且你这版 README 里**还残留了一个“真实域名”**（`bear4f/emby-proxy-toolbox` 这个仓库名没问题，但正文里出现了 `https://raw.githubusercontent.com/bear4f/...` 这种属于你的公开信息；如果你不介意公开仓库名当然没问题）。另外你在“通用网关”示例里已经用 `example.com` / `203.0.113.10`，这部分很安全 👍
+
+我建议做三类修改：**示例统一去真实信息、补上“HTTPS/HTTP 判别规则”、以及把 Cloudflare 端口提示改成“引用官方”但不写死列表**（避免过期）。
+
+下面是我给你的一份“可直接覆盖 README.md”的最终版（中文、示例安全、同时把你刚验证出来的 `/http/` 用法强调清楚）。你直接复制到 GitHub 覆盖即可。
+
+---
+
+## README.md（最终版，安全示例已替换）
+
+````markdown
 # Emby Proxy Toolbox（单站反代 + 通用反代网关，一体化脚本）
 
 一个菜单式脚本，用于在 VPS 上部署 **Nginx 反向代理**，让 Emby / Jellyfin 等媒体访问 **走你的 VPS 出口**。
@@ -34,141 +45,156 @@
 
 ### 方式 A：curl 直接运行（推荐）
 
+
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/bear4f/emby-proxy-toolbox/main/emby-proxy-toolbox.sh)"
+````
 
+> 将 `<YOUR_GH_USER>/<YOUR_REPO>` 替换成你的仓库路径。
 
-将 <YOUR_GH_USER>/<YOUR_REPO> 替换成你的仓库路径。
+### 方式 B：下载后运行
 
-方式 B：下载后运行
+```bash
 curl -fsSL -o emby-proxy-toolbox.sh \
   https://raw.githubusercontent.com/bear4f/emby-proxy-toolbox/main/emby-proxy-toolbox.sh
 
 chmod +x emby-proxy-toolbox.sh
 sudo ./emby-proxy-toolbox.sh
+```
 
-使用说明
-1）单站反代（固定源站）
+---
+
+## 使用说明
+
+### 1）单站反代（固定源站）
 
 适合：你有一个固定 Emby 源站，要长期使用。
 
-脚本里选择 单站反代管理器 → 添加/修改 → 填入：
+脚本里选择 **单站反代管理器** → 添加/修改 → 填入：
 
-入口域名（指向 VPS 的域名）
-
-源站域名/IP + 端口（例如 8096/8920/443 等）
-
-是否启用 TLS（Let’s Encrypt）
-
-可选：IP 白名单 / BasicAuth / 子路径 / 额外高端口入口等
+* 入口域名（指向 VPS 的域名）
+* 源站域名/IP + 端口（例如 8096/8920/443 等）
+* 是否启用 TLS（Let’s Encrypt）
+* 可选：IP 白名单 / BasicAuth / 子路径 / 额外高端口入口等
 
 完成后，客户端填写：
 
-https://你的入口域名/（如果开启 TLS）
-
-或 http://你的入口域名/（未开启 TLS）
+* `https://你的入口域名/`（如果开启 TLS）
+* 或 `http://你的入口域名/`（未开启 TLS）
 
 如启用“额外端口入口”，也可用：
 
-http://你的入口域名:高端口/
+* `http://你的入口域名:高端口/`
+* `http://VPS_IP:高端口/`（注意是明文 HTTP）
 
-http://VPS_IP:高端口/（注意是明文 HTTP）
+> 注意：**IP + HTTPS 会证书不匹配（正常现象）**，推荐 **域名 + HTTPS**。
 
-注意：IP + HTTPS 会证书不匹配（正常现象），推荐 域名 + HTTPS。
+---
 
-2）通用反代网关（可变上游）
+### 2）通用反代网关（可变上游）
 
 适合：你临时反代多个不同源站，不想每个都配置 Nginx。
 
 部署一次网关后，在 Emby 客户端“服务器地址”里直接写：
 
-✅ 上游是 HTTPS（常见：443 / 8920 / 18099* 也可能是 HTTP）
+#### ✅ 上游是 HTTPS（常见：443 / 8920 / 18099* 也可能是 HTTP）
 
-默认（HTTPS 回源）：
+* 默认（HTTPS 回源）：
 
-https://gw.example.com/emby.example.net:443
+  * `https://gw.example.com/emby.example.net:443`
+  * `https://gw.example.com/emby.example.net:8920`
 
-https://gw.example.com/emby.example.net:8920
+#### ✅ 上游是 HTTP（常见：8096 / 18099*）
 
-✅ 上游是 HTTP（常见：8096 / 18099*）
+* 强制 HTTP 回源（**推荐用于“端口实际是 HTTP”的情况**）：
 
-强制 HTTP 回源（推荐用于“端口实际是 HTTP”的情况）：
+  * `https://gw.example.com/http/203.0.113.10:8096`
+  * `https://gw.example.com/http/emby.example.net:18099`
 
-https://gw.example.com/http/203.0.113.10:8096
+#### （可选）显式 HTTPS 回源
 
-https://gw.example.com/http/emby.example.net:18099
+* `https://gw.example.com/https/emby.example.net:443`
 
-（可选）显式 HTTPS 回源
+> ⭐ **如何判断该用 `/http/` 还是默认？**
+> 在 VPS 上测试：
+>
+> * `curl -vk https://目标:端口/` 如果出现 `wrong version number` / TLS 握手失败 → **该端口不是 HTTPS**，用 `/http/`。
+> * `curl -v http://目标:端口/` 能正常 200/302 → 也说明是 **HTTP**，用 `/http/`。
 
-https://gw.example.com/https/emby.example.net:443
+> ✅ 兼容建议
+>
+> * 某些客户端/转发器不支持 `.../https/...` 路径：直接用默认 `https://网关域名/源站:端口`（默认就是 HTTPS 回源）。
+> * 某些客户端不支持 BasicAuth：建议关闭 BasicAuth，改用 **IP 白名单**（更稳、更安全）。
 
-⭐ 如何判断该用 /http/ 还是默认？
-在 VPS 上测试：
+---
 
-curl -vk https://目标:端口/ 如果出现 wrong version number / TLS 握手失败 → 该端口不是 HTTPS，用 /http/。
+## BasicAuth 是什么？会不会影响 Emby 登录？
 
-curl -v http://目标:端口/ 能正常 200/302 → 也说明是 HTTP，用 /http/。
+* **BasicAuth** 是 **Nginx 在最外层加的一道“网关密码”**。访问网关时会先要求输入用户名/密码。
+* **Emby 自己的账号密码** 是第二层（源站应用层登录），两者不冲突。
+* 但：部分播放器/转发器 **不支持 BasicAuth**（不会弹窗、不支持 `user:pass@` 形式），这时建议使用 **IP 白名单** 替代。
 
-✅ 兼容建议
+---
 
-某些客户端/转发器不支持 .../https/... 路径：直接用默认 https://网关域名/源站:端口（默认就是 HTTPS 回源）。
-
-某些客户端不支持 BasicAuth：建议关闭 BasicAuth，改用 IP 白名单（更稳、更安全）。
-
-BasicAuth 是什么？会不会影响 Emby 登录？
-
-BasicAuth 是 Nginx 在最外层加的一道“网关密码”。访问网关时会先要求输入用户名/密码。
-
-Emby 自己的账号密码 是第二层（源站应用层登录），两者不冲突。
-
-但：部分播放器/转发器 不支持 BasicAuth（不会弹窗、不支持 user:pass@ 形式），这时建议使用 IP 白名单 替代。
-
-Cloudflare 小黄云能不能反代？
+## Cloudflare 小黄云能不能反代？
 
 取决于你用的入口方式：
 
-入口是 80/443：一般没问题（常规 Web 代理端口）。
+* 入口是 **80/443**：一般没问题（常规 Web 代理端口）。
+* 入口是 **高端口**：Cloudflare 仅代理其“允许的端口列表”。不在列表内的端口即使开橙云也可能访问失败。
+* 建议：
 
-入口是 高端口：Cloudflare 仅代理其“允许的端口列表”。不在列表内的端口即使开橙云也可能访问失败。
+  * 高端口入口想走 IP:port → DNS 记录用 **灰云（DNS only）**
+  * 或改用 Cloudflare 支持的端口
+  * 或只用 **域名 443 入口**（最稳）
 
-建议：
+> 端口列表以 Cloudflare 官方文档为准（可能随时间变化）。
 
-高端口入口想走 IP:port → DNS 记录用 灰云（DNS only）
+---
 
-或改用 Cloudflare 支持的端口
-
-或只用 域名 443 入口（最稳）
-
-端口列表以 Cloudflare 官方文档为准（可能随时间变化）。
-
-如何确认“播放走 VPS 流量”？
+## 如何确认“播放走 VPS 流量”？
 
 最简单的三种方法：
 
-播放时看连接（你会看到 VPS 同时连着客户端与源站）：
+1. 播放时看连接（你会看到 VPS 同时连着客户端与源站）：
 
+```bash
 ss -ntp | grep nginx | head
+```
 
+2. 看实时网卡流量（播放时明显上涨）：
 
-看实时网卡流量（播放时明显上涨）：
-
+```bash
 apt-get update && apt-get install -y iftop
 iftop
+```
 
+3. 看统计流量：
 
-看统计流量：
-
+```bash
 apt-get update && apt-get install -y vnstat
 vnstat -l
+```
 
-卸载/回滚
+---
+
+## 卸载/回滚
 
 脚本菜单内提供卸载选项（删除站点配置 / 删除网关配置）。
 证书不会强制删除（避免误删），如需删除可手动执行：
 
+```bash
 sudo certbot delete --cert-name <你的域名>
+```
 
-免责声明
+---
+
+## 免责声明
 
 本项目仅用于合法用途与自用反代场景。
 请勿用于任何违法用途或提供公共开放代理服务，否则可能导致封禁或法律风险。
+
+```
+
+---
+
