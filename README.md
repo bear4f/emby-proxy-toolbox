@@ -1,4 +1,3 @@
-README.md（最终版，安全示例已替换）
 # Emby Proxy Toolbox（单站反代 + 通用反代网关，一体化脚本）
 
 一个菜单式脚本，用于在 VPS 上部署 **Nginx 反向代理**，让 Emby / Jellyfin 等媒体访问 **走你的 VPS 出口**。
