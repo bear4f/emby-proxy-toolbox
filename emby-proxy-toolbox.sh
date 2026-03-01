@@ -7,11 +7,7 @@ set -euo pipefail
 SITES_AVAIL="/etc/nginx/sites-available"
 SITES_ENAB="/etc/nginx/sites-enabled"
 BACKUP_ROOT="/root"
-
-# 默认保留备份数量（可通过环境变量 KEEP_BACKUPS 覆盖）
-# 注意：脚本启用了 `set -u`，未定义变量会直接报错；卸载/回滚路径会调用备份清理逻辑。
-KEEP_BACKUPS="${KEEP_BACKUPS:-5}"
-export KEEP_BACKUPS
+BACKUP_KEEP=2  # 保留最近多少份 nginx-backup 目录
 
 # 单站管理器
 SINGLE_PREFIX="emby-"
@@ -28,6 +24,32 @@ TOOL_NAME="emby-proxy-toolbox"
 
 need_root() { [[ "${EUID}" -eq 0 ]] || { echo "请用 root 运行：sudo bash $0"; exit 1; }; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+
+backup_copy() {
+  # backup_copy <src_path> [tag]
+  # Always back up to "<base>.bak.<tag>.<ts>" where <base> strips any existing ".bak*"
+  local src="$1"
+  local tag="${2:-bak}"
+  local ts base dst
+
+  [[ -f "$src" || -L "$src" ]] || return 0
+
+  ts="$(date +%F_%H%M%S)"
+
+  # Strip anything from the first ".bak" onwards to avoid filename stacking
+  base="${src%%.bak*}"
+  [[ -z "$base" ]] && base="$src"
+
+  dst="${base}.bak.${tag}.${ts}"
+
+  # If dst already exists (rare), append a random suffix
+  if [[ -e "$dst" ]]; then
+    dst="${dst}.$RANDOM"
+  fi
+
+  cp -a "$src" "$dst"
+}
 
 prompt() {
   local __var="$1" __msg="$2" __def="${3:-}"
@@ -79,38 +101,14 @@ ensure_htpasswd_cmd() {
   fi
 }
 
-prune_nginx_backup_dirs() {
-  # 保留最近 keep 份 /root/nginx-backup-* 目录
-  local keep="${1:-${KEEP_BACKUPS:-5}}"
-  [[ "$keep" =~ ^[0-9]+$ ]] || keep="${KEEP_BACKUPS:-5}"
-  (( keep >= 1 )) || keep=1
-  ls -1dt "${BACKUP_ROOT}/nginx-backup-"* 2>/dev/null | tail -n +$((keep+1)) | while read -r d; do
-    [[ -n "$d" ]] || continue
-    rm -rf -- "$d" 2>/dev/null || true
-  done
-}
-
-prune_file_backups() {
-  # 保留最近 keep 份 <file>.bak.<ts> 备份
-  local base="$1"
-  local keep="${2:-${KEEP_BACKUPS:-5}}"
-  [[ -n "$base" ]] || return 0
-  [[ "$keep" =~ ^[0-9]+$ ]] || keep="${KEEP_BACKUPS:-5}"
-  (( keep >= 1 )) || keep=1
-  ls -1dt "${base}.bak."* 2>/dev/null | tail -n +$((keep+1)) | while read -r f; do
-    [[ -n "$f" ]] || continue
-    rm -f -- "$f" 2>/dev/null || true
-  done
-}
-
-
 backup_nginx() {
   local ts dir
   ts="$(date +%Y%m%d_%H%M%S)"
   dir="${BACKUP_ROOT}/nginx-backup-${ts}"
   mkdir -p "$dir/nginx"
   rsync -a /etc/nginx/ "$dir/nginx/"
-  prune_nginx_backup_dirs "${KEEP_BACKUPS:-5}"
+  prune_nginx_backups
+
   echo "$dir"
 }
 restore_nginx() { local dir="$1"; rsync -a --delete "$dir/nginx/" /etc/nginx/; }
@@ -136,12 +134,34 @@ apply_with_rollback() {
   reload_nginx
 }
 
+prune_nginx_backups() {
+  # 保留最近 ${BACKUP_KEEP} 份 /root/nginx-backup-YYYYmmdd_HHMMSS 目录，自动清理更早的备份
+  local keep="${BACKUP_KEEP:-2}"
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep=2
+  (( keep < 1 )) && keep=1
+
+  # 只匹配目录，按时间倒序
+  local d
+  mapfile -t _bk_dirs < <(ls -1dt "${BACKUP_ROOT}"/nginx-backup-* 2>/dev/null | while read -r d; do [[ -d "$d" ]] && echo "$d"; done)
+
+  local total="${#_bk_dirs[@]}"
+  (( total <= keep )) && return 0
+
+  local i
+  for ((i=keep; i<total; i++)); do
+    d="${_bk_dirs[$i]}"
+    # 双重保险：只删符合前缀的目录
+    [[ -n "$d" && "$d" == "${BACKUP_ROOT}/nginx-backup-"* && -d "$d" ]] || continue
+    rm -rf -- "$d" 2>/dev/null || true
+  done
+}
+
 ensure_sites_enabled_include() {
   local main="/etc/nginx/nginx.conf"
   [[ -f "$main" ]] || return 0
   grep -qE 'include\s+/etc/nginx/sites-enabled/\*;' "$main" && return 0
 
-  cp -a "$main" "${main}.bak.$(date +%F_%H%M%S)"
+  backup_copy "$main" "ensure_include"
   if grep -qE 'include\s+/etc/nginx/conf\.d/\*\.conf;' "$main"; then
     sed -i '/include\s\+\/etc\/nginx\/conf\.d\/\*\.conf;/a\    include /etc/nginx/sites-enabled/*;' "$main"
   else
@@ -157,20 +177,12 @@ nginx_self_heal_compat() {
   [[ -f "$main" ]] || return 0
 
   # 注释 $http3
-  # 仅扫描真实配置文件，跳过脚本生成的 .bak.* 备份，避免备份链条引发异常
   local http3_files
-  http3_files="$(grep -RIl --exclude='*.bak.*' --exclude-dir='nginx-backup-*' '\$http3\b' /etc/nginx 2>/dev/null || true)"
+  http3_files="$(grep -RIl '\$http3\b' /etc/nginx 2>/dev/null || true)"
   if [[ -n "$http3_files" ]]; then
     while read -r f; do
       [[ -z "$f" ]] && continue
-      # 双保险：即便 grep 未正确排除，也不要处理备份文件
-      case "$f" in
-        *.bak.*) continue ;;
-      esac
-      [[ -f "$f" ]] || continue
-      # 注意：cp 源/目的顺序不可颠倒；统一加 -- 避免奇怪文件名被当参数
-      cp -a -- "$f" "${f}.bak.${ts}"
-	    prune_file_backups "$f" "${KEEP_BACKUPS:-5}"
+      backup_copy "$f" "compat"
       sed -i '/\$http3\b/s/^/# /' "$f"
     done <<< "$http3_files"
     changed="y"
@@ -178,8 +190,7 @@ nginx_self_heal_compat() {
 
   # 注释 quic/http3/ssl_reject_handshake
   if grep -qiE '\b(quic_bpf|http3|ssl_reject_handshake)\b' "$main"; then
-    cp -a "$main" "${main}.bak.${ts}"
-	prune_file_backups "$main" "${KEEP_BACKUPS:-5}"
+    backup_copy "$main" "compat"
     sed -i -E '
       s/^\s*quic_bpf\b/# quic_bpf/;
       s/^\s*http3\b/# http3/;
@@ -202,8 +213,7 @@ nginx_self_heal_compat() {
       }
       END{exit 0;}
     ' "$main"; then
-      cp -a "$main" "${main}.bak.${ts}"
-	prune_file_backups "$main" "${KEEP_BACKUPS:-5}"
+      backup_copy "$main" "auto"
       awk '
         BEGIN{state=0;lvl=0;match=0;}
         {
@@ -498,7 +508,7 @@ single_action_add_or_edit() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap '[[ -n "${dump:-}" ]] && rm -f "$dump"; trap - RETURN' RETURN
+  trap 'rm -f "$dump"' RETURN
 
   set +e
   single_write_site_conf "$DOMAIN" "$ORIGIN_HOST" "$ORIGIN_PORT" "$ORIGIN_SCHEME" \
@@ -591,7 +601,7 @@ single_action_delete() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap '[[ -n "${dump:-}" ]] && rm -f "$dump"; trap - RETURN' RETURN
+  trap 'rm -f "$dump"' RETURN
 
   rm -f "$enabled" "$conf"
   apply_with_rollback "$backup" "$dump" || return 1
@@ -872,7 +882,7 @@ gw_action_install_update() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap '[[ -n "${dump:-}" ]] && rm -f "$dump"; trap - RETURN' RETURN
+  trap 'rm -f "$dump"' RETURN
 
   gw_write_map_conf
   gw_write_locations_snippet "$ENABLE_BASICAUTH" "$ENABLE_IPWL" "$IPWL"
@@ -957,7 +967,7 @@ gw_action_uninstall() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap '[[ -n "${dump:-}" ]] && rm -f "$dump"; trap - RETURN' RETURN
+  trap 'rm -f "$dump"' RETURN
 
   rm -f "$enabled" "$conf" "$GW_MAP_CONF" "$GW_SNIP_CONF" "$GW_HTPASSWD" 2>/dev/null || true
   apply_with_rollback "$backup" "$dump" || true
