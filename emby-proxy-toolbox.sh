@@ -3,11 +3,13 @@
 # 一体化 Emby 反代工具箱（单站反代管理器 + 通用反代网关）
 set -euo pipefail
 
+
+# Backup retention (keep last N backups). You can override by exporting KEEP_BACKUPS.
+KEEP_BACKUPS="${KEEP_BACKUPS:-2}"
 # -------------------- 通用配置 --------------------
 SITES_AVAIL="/etc/nginx/sites-available"
 SITES_ENAB="/etc/nginx/sites-enabled"
 BACKUP_ROOT="/root"
-BACKUP_KEEP=2  # 保留最近多少份 nginx-backup 目录
 
 # 单站管理器
 SINGLE_PREFIX="emby-"
@@ -24,32 +26,6 @@ TOOL_NAME="emby-proxy-toolbox"
 
 need_root() { [[ "${EUID}" -eq 0 ]] || { echo "请用 root 运行：sudo bash $0"; exit 1; }; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-
-backup_copy() {
-  # backup_copy <src_path> [tag]
-  # Always back up to "<base>.bak.<tag>.<ts>" where <base> strips any existing ".bak*"
-  local src="$1"
-  local tag="${2:-bak}"
-  local ts base dst
-
-  [[ -f "$src" || -L "$src" ]] || return 0
-
-  ts="$(date +%F_%H%M%S)"
-
-  # Strip anything from the first ".bak" onwards to avoid filename stacking
-  base="${src%%.bak*}"
-  [[ -z "$base" ]] && base="$src"
-
-  dst="${base}.bak.${tag}.${ts}"
-
-  # If dst already exists (rare), append a random suffix
-  if [[ -e "$dst" ]]; then
-    dst="${dst}.$RANDOM"
-  fi
-
-  cp -a "$src" "$dst"
-}
 
 prompt() {
   local __var="$1" __msg="$2" __def="${3:-}"
@@ -101,14 +77,49 @@ ensure_htpasswd_cmd() {
   fi
 }
 
+prune_nginx_backup_dirs() {
+  # 保留最近 keep 份 /root/nginx-backup-* 目录
+  local keep="${1:-$KEEP_BACKUPS}"
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep="$KEEP_BACKUPS"
+  (( keep >= 1 )) || keep=1
+  ls -1dt "${BACKUP_ROOT}/nginx-backup-"* 2>/dev/null | tail -n +$((keep+1)) | while read -r d; do
+    [[ -n "$d" ]] || continue
+    rm -rf -- "$d" 2>/dev/null || true
+  done
+}
+
+prune_file_backups() {
+  # 保留最近 keep 份 <file>.bak.<ts> 备份
+  local base="$1"
+  local keep="${2:-$KEEP_BACKUPS}"
+  [[ -n "$base" ]] || return 0
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep="$KEEP_BACKUPS"
+  (( keep >= 1 )) || keep=1
+  ls -1dt "${base}.bak."* 2>/dev/null | tail -n +$((keep+1)) | while read -r f; do
+    [[ -n "$f" ]] || continue
+    rm -f -- "$f" 2>/dev/null || true
+  done
+}
+
+
+prune_existing_nginx_baks() {
+  # Keep backups under /etc/nginx tidy: for each <file>.bak.<ts> keep last $KEEP_BACKUPS.
+  local f base
+  while IFS= read -r -d '' f; do
+    base="${f%%.bak.*}"
+    [[ -f "$base" ]] || continue
+    prune_file_backups "$base" "$KEEP_BACKUPS"
+  done < <(find /etc/nginx -type f -name "*.bak.*" -print0 2>/dev/null || true)
+}
+
+
 backup_nginx() {
   local ts dir
   ts="$(date +%Y%m%d_%H%M%S)"
   dir="${BACKUP_ROOT}/nginx-backup-${ts}"
   mkdir -p "$dir/nginx"
   rsync -a /etc/nginx/ "$dir/nginx/"
-  prune_nginx_backups
-
+  prune_nginx_backup_dirs "$KEEP_BACKUPS"
   echo "$dir"
 }
 restore_nginx() { local dir="$1"; rsync -a --delete "$dir/nginx/" /etc/nginx/; }
@@ -134,34 +145,12 @@ apply_with_rollback() {
   reload_nginx
 }
 
-prune_nginx_backups() {
-  # 保留最近 ${BACKUP_KEEP} 份 /root/nginx-backup-YYYYmmdd_HHMMSS 目录，自动清理更早的备份
-  local keep="${BACKUP_KEEP:-2}"
-  [[ "$keep" =~ ^[0-9]+$ ]] || keep=2
-  (( keep < 1 )) && keep=1
-
-  # 只匹配目录，按时间倒序
-  local d
-  mapfile -t _bk_dirs < <(ls -1dt "${BACKUP_ROOT}"/nginx-backup-* 2>/dev/null | while read -r d; do [[ -d "$d" ]] && echo "$d"; done)
-
-  local total="${#_bk_dirs[@]}"
-  (( total <= keep )) && return 0
-
-  local i
-  for ((i=keep; i<total; i++)); do
-    d="${_bk_dirs[$i]}"
-    # 双重保险：只删符合前缀的目录
-    [[ -n "$d" && "$d" == "${BACKUP_ROOT}/nginx-backup-"* && -d "$d" ]] || continue
-    rm -rf -- "$d" 2>/dev/null || true
-  done
-}
-
 ensure_sites_enabled_include() {
   local main="/etc/nginx/nginx.conf"
   [[ -f "$main" ]] || return 0
   grep -qE 'include\s+/etc/nginx/sites-enabled/\*;' "$main" && return 0
 
-  backup_copy "$main" "ensure_include"
+  cp -a "$main" "${main}.bak.$(date +%F_%H%M%S)"
   if grep -qE 'include\s+/etc/nginx/conf\.d/\*\.conf;' "$main"; then
     sed -i '/include\s\+\/etc\/nginx\/conf\.d\/\*\.conf;/a\    include /etc/nginx/sites-enabled/*;' "$main"
   else
@@ -182,7 +171,9 @@ nginx_self_heal_compat() {
   if [[ -n "$http3_files" ]]; then
     while read -r f; do
       [[ -z "$f" ]] && continue
-      backup_copy "$f" "compat"
+    [[ "$f" == *".bak."* || "$f" == *.bak ]] && continue
+      cp -a "$f" "${f}.bak.${ts}"
+    prune_file_backups "$f" "$KEEP_BACKUPS"
       sed -i '/\$http3\b/s/^/# /' "$f"
     done <<< "$http3_files"
     changed="y"
@@ -190,7 +181,8 @@ nginx_self_heal_compat() {
 
   # 注释 quic/http3/ssl_reject_handshake
   if grep -qiE '\b(quic_bpf|http3|ssl_reject_handshake)\b' "$main"; then
-    backup_copy "$main" "compat"
+    cp -a "$main" "${main}.bak.${ts}"
+  prune_file_backups "$main" "$KEEP_BACKUPS"
     sed -i -E '
       s/^\s*quic_bpf\b/# quic_bpf/;
       s/^\s*http3\b/# http3/;
@@ -213,7 +205,8 @@ nginx_self_heal_compat() {
       }
       END{exit 0;}
     ' "$main"; then
-      backup_copy "$main" "auto"
+      cp -a "$main" "${main}.bak.${ts}"
+  prune_file_backups "$main" "$KEEP_BACKUPS"
       awk '
         BEGIN{state=0;lvl=0;match=0;}
         {
@@ -508,7 +501,7 @@ single_action_add_or_edit() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap 'rm -f "$dump"' RETURN
+  trap '[[ -n "${dump:-}" ]] && rm -f "$dump"; trap - RETURN' RETURN
 
   set +e
   single_write_site_conf "$DOMAIN" "$ORIGIN_HOST" "$ORIGIN_PORT" "$ORIGIN_SCHEME" \
@@ -601,7 +594,7 @@ single_action_delete() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap 'rm -f "$dump"' RETURN
+  trap '[[ -n "${dump:-}" ]] && rm -f "$dump"; trap - RETURN' RETURN
 
   rm -f "$enabled" "$conf"
   apply_with_rollback "$backup" "$dump" || return 1
@@ -716,6 +709,13 @@ __ALLOW_SNIP__
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
 
+    # 保持重定向仍走网关（proxy_pass 使用变量时，nginx 默认不会改写 Location/Refresh）
+    set $gw_prefix /http/$up_target;
+    proxy_redirect ~*^(http|https)://[^/]+(.*)$ $scheme://$host$gw_prefix$2;
+    proxy_redirect ~^//[^/]+(.*)$ $scheme://$host$gw_prefix$1;
+    proxy_redirect ~^(/.*)$ $gw_prefix$1;
+
+
     proxy_ssl_server_name on;
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
@@ -733,6 +733,13 @@ __ALLOW_SNIP__
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
 
+    # 保持重定向仍走网关（proxy_pass 使用变量时，nginx 默认不会改写 Location/Refresh）
+    set $gw_prefix /https/$up_target;
+    proxy_redirect ~*^(http|https)://[^/]+(.*)$ $scheme://$host$gw_prefix$2;
+    proxy_redirect ~^//[^/]+(.*)$ $scheme://$host$gw_prefix$1;
+    proxy_redirect ~^(/.*)$ $gw_prefix$1;
+
+
     proxy_ssl_server_name on;
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
@@ -749,6 +756,13 @@ __ALLOW_SNIP__
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
+
+    # 保持重定向仍走网关（proxy_pass 使用变量时，nginx 默认不会改写 Location/Refresh）
+    set $gw_prefix /$up_target;
+    proxy_redirect ~*^(http|https)://[^/]+(.*)$ $scheme://$host$gw_prefix$2;
+    proxy_redirect ~^//[^/]+(.*)$ $scheme://$host$gw_prefix$1;
+    proxy_redirect ~^(/.*)$ $gw_prefix$1;
+
 
     proxy_ssl_server_name on;
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
@@ -882,7 +896,7 @@ gw_action_install_update() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap 'rm -f "$dump"' RETURN
+  trap '[[ -n "${dump:-}" ]] && rm -f "$dump"; trap - RETURN' RETURN
 
   gw_write_map_conf
   gw_write_locations_snippet "$ENABLE_BASICAUTH" "$ENABLE_IPWL" "$IPWL"
@@ -967,7 +981,7 @@ gw_action_uninstall() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap 'rm -f "$dump"' RETURN
+  trap '[[ -n "${dump:-}" ]] && rm -f "$dump"; trap - RETURN' RETURN
 
   rm -f "$enabled" "$conf" "$GW_MAP_CONF" "$GW_SNIP_CONF" "$GW_HTPASSWD" 2>/dev/null || true
   apply_with_rollback "$backup" "$dump" || true
