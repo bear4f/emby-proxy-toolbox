@@ -7,7 +7,6 @@ set -euo pipefail
 SITES_AVAIL="/etc/nginx/sites-available"
 SITES_ENAB="/etc/nginx/sites-enabled"
 BACKUP_ROOT="/root"
-BACKUP_KEEP="2"
 
 # 单站管理器
 SINGLE_PREFIX="emby-"
@@ -24,53 +23,6 @@ TOOL_NAME="emby-proxy-toolbox"
 
 need_root() { [[ "${EUID}" -eq 0 ]] || { echo "请用 root 运行：sudo bash $0"; exit 1; }; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-# ---- backup helpers (avoid .bak recursion; keep last ${BACKUP_KEEP}) ----
-is_bak_path() { [[ "$1" == *".bak."* || "$1" == *.bak ]]; }
-bak_base_path() { local p="$1"; echo "${p%%.bak.*}"; }
-
-prune_baks_for_base() {
-  local base="$1" keep="${2:-2}"
-  shopt -s nullglob
-  local arr=("${base}.bak."*)
-  shopt -u nullglob
-  (( ${#arr[@]} <= keep )) && return 0
-  # sort by mtime desc
-  mapfile -t arr < <(ls -1t "${base}.bak."* 2>/dev/null)
-  local i
-  for ((i=keep; i<${#arr[@]}; i++)); do
-    rm -f "${arr[$i]}" 2>/dev/null || true
-  done
-}
-
-backup_inplace() {
-  local p="$1"
-  [[ -e "$p" ]] || return 0
-  # never backup backup-of-backup
-  if is_bak_path "$p"; then return 0; fi
-
-  local base; base="$(bak_base_path "$p")"
-  local ts; ts="$(date +%F_%H%M%S)"
-  local bak="${base}.bak.${ts}"
-
-  cp -a "$base" "$bak"
-  prune_baks_for_base "$base" "${BACKUP_KEEP}"
-}
-
-prune_backup_dirs() {
-  local prefix="$1" keep="${2:-2}"
-  shopt -s nullglob
-  local dirs=("${BACKUP_ROOT}/${prefix}"*)
-  shopt -u nullglob
-  (( ${#dirs[@]} <= keep )) && return 0
-  mapfile -t dirs < <(ls -1dt "${BACKUP_ROOT}/${prefix}"* 2>/dev/null)
-  local i
-  for ((i=keep; i<${#dirs[@]}; i++)); do
-    rm -rf "${dirs[$i]}" 2>/dev/null || true
-  done
-}
-# -----------------------------------------------------------------------
-
 
 prompt() {
   local __var="$1" __msg="$2" __def="${3:-}"
@@ -122,13 +74,38 @@ ensure_htpasswd_cmd() {
   fi
 }
 
+prune_nginx_backup_dirs() {
+  # 保留最近 keep 份 /root/nginx-backup-* 目录
+  local keep="${1:-$KEEP_BACKUPS}"
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep="$KEEP_BACKUPS"
+  (( keep >= 1 )) || keep=1
+  ls -1dt "${BACKUP_ROOT}/nginx-backup-"* 2>/dev/null | tail -n +$((keep+1)) | while read -r d; do
+    [[ -n "$d" ]] || continue
+    rm -rf -- "$d" 2>/dev/null || true
+  done
+}
+
+prune_file_backups() {
+  # 保留最近 keep 份 <file>.bak.<ts> 备份
+  local base="$1"
+  local keep="${2:-$KEEP_BACKUPS}"
+  [[ -n "$base" ]] || return 0
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep="$KEEP_BACKUPS"
+  (( keep >= 1 )) || keep=1
+  ls -1dt "${base}.bak."* 2>/dev/null | tail -n +$((keep+1)) | while read -r f; do
+    [[ -n "$f" ]] || continue
+    rm -f -- "$f" 2>/dev/null || true
+  done
+}
+
+
 backup_nginx() {
   local ts dir
   ts="$(date +%Y%m%d_%H%M%S)"
   dir="${BACKUP_ROOT}/nginx-backup-${ts}"
   mkdir -p "$dir/nginx"
   rsync -a /etc/nginx/ "$dir/nginx/"
-  prune_backup_dirs "nginx-backup-" "${BACKUP_KEEP}"
+  prune_nginx_backup_dirs "$KEEP_BACKUPS"
   echo "$dir"
 }
 restore_nginx() { local dir="$1"; rsync -a --delete "$dir/nginx/" /etc/nginx/; }
@@ -176,11 +153,12 @@ nginx_self_heal_compat() {
 
   # 注释 $http3
   local http3_files
-  http3_files="$(grep -RIl --exclude='*.bak*' '\$http3' /etc/nginx 2>/dev/null || true)"
+  http3_files="$(grep -RIl '\$http3\b' /etc/nginx 2>/dev/null || true)"
   if [[ -n "$http3_files" ]]; then
     while read -r f; do
       [[ -z "$f" ]] && continue
       cp -a "$f" "${f}.bak.${ts}"
+    prune_file_backups "$f" "$KEEP_BACKUPS"
       sed -i '/\$http3\b/s/^/# /' "$f"
     done <<< "$http3_files"
     changed="y"
@@ -189,6 +167,7 @@ nginx_self_heal_compat() {
   # 注释 quic/http3/ssl_reject_handshake
   if grep -qiE '\b(quic_bpf|http3|ssl_reject_handshake)\b' "$main"; then
     cp -a "$main" "${main}.bak.${ts}"
+  prune_file_backups "$main" "$KEEP_BACKUPS"
     sed -i -E '
       s/^\s*quic_bpf\b/# quic_bpf/;
       s/^\s*http3\b/# http3/;
@@ -212,6 +191,7 @@ nginx_self_heal_compat() {
       END{exit 0;}
     ' "$main"; then
       cp -a "$main" "${main}.bak.${ts}"
+  prune_file_backups "$main" "$KEEP_BACKUPS"
       awk '
         BEGIN{state=0;lvl=0;match=0;}
         {
@@ -506,7 +486,7 @@ single_action_add_or_edit() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap 'rm -f "$dump"' RETURN
+  trap '[[ -n "${dump:-}" ]] && rm -f "$dump"; trap - RETURN' RETURN
 
   set +e
   single_write_site_conf "$DOMAIN" "$ORIGIN_HOST" "$ORIGIN_PORT" "$ORIGIN_SCHEME" \
@@ -599,7 +579,7 @@ single_action_delete() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap 'rm -f "$dump"' RETURN
+  trap '[[ -n "${dump:-}" ]] && rm -f "$dump"; trap - RETURN' RETURN
 
   rm -f "$enabled" "$conf"
   apply_with_rollback "$backup" "$dump" || return 1
@@ -880,7 +860,7 @@ gw_action_install_update() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap 'rm -f "$dump"' RETURN
+  trap '[[ -n "${dump:-}" ]] && rm -f "$dump"; trap - RETURN' RETURN
 
   gw_write_map_conf
   gw_write_locations_snippet "$ENABLE_BASICAUTH" "$ENABLE_IPWL" "$IPWL"
@@ -965,7 +945,7 @@ gw_action_uninstall() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap 'rm -f "$dump"' RETURN
+  trap '[[ -n "${dump:-}" ]] && rm -f "$dump"; trap - RETURN' RETURN
 
   rm -f "$enabled" "$conf" "$GW_MAP_CONF" "$GW_SNIP_CONF" "$GW_HTPASSWD" 2>/dev/null || true
   apply_with_rollback "$backup" "$dump" || true
