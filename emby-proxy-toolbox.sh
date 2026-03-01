@@ -11,6 +11,7 @@ BACKUP_ROOT="/root"
 # 默认保留备份数量（可通过环境变量 KEEP_BACKUPS 覆盖）
 # 注意：脚本启用了 `set -u`，未定义变量会直接报错；卸载/回滚路径会调用备份清理逻辑。
 KEEP_BACKUPS="${KEEP_BACKUPS:-5}"
+export KEEP_BACKUPS
 
 # 单站管理器
 SINGLE_PREFIX="emby-"
@@ -156,12 +157,19 @@ nginx_self_heal_compat() {
   [[ -f "$main" ]] || return 0
 
   # 注释 $http3
+  # 仅扫描真实配置文件，跳过脚本生成的 .bak.* 备份，避免备份链条引发异常
   local http3_files
-  http3_files="$(grep -RIl '\$http3\b' /etc/nginx 2>/dev/null || true)"
+  http3_files="$(grep -RIl --exclude='*.bak.*' --exclude-dir='nginx-backup-*' '\$http3\b' /etc/nginx 2>/dev/null || true)"
   if [[ -n "$http3_files" ]]; then
     while read -r f; do
       [[ -z "$f" ]] && continue
-      cp -a "$f" "${f}.bak.${ts}"
+      # 双保险：即便 grep 未正确排除，也不要处理备份文件
+      case "$f" in
+        *.bak.*) continue ;;
+      esac
+      [[ -f "$f" ]] || continue
+      # 注意：cp 源/目的顺序不可颠倒；统一加 -- 避免奇怪文件名被当参数
+      cp -a -- "$f" "${f}.bak.${ts}"
 	    prune_file_backups "$f" "${KEEP_BACKUPS:-5}"
       sed -i '/\$http3\b/s/^/# /' "$f"
     done <<< "$http3_files"
