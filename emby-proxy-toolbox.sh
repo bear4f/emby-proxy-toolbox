@@ -694,6 +694,13 @@ __ALLOW_SNIP__
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
 
+    # 保持重定向仍走网关（proxy_pass 使用变量时，nginx 默认不会改写 Location/Refresh）
+    set $gw_prefix /http/$up_target;
+    proxy_redirect ~*^(http|https)://[^/]+(.*)$ $scheme://$host$gw_prefix$2;
+    proxy_redirect ~^//[^/]+(.*)$ $scheme://$host$gw_prefix$1;
+    proxy_redirect ~^(/.*)$ $gw_prefix$1;
+
+
     proxy_ssl_server_name on;
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
@@ -711,6 +718,13 @@ __ALLOW_SNIP__
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
 
+    # 保持重定向仍走网关（proxy_pass 使用变量时，nginx 默认不会改写 Location/Refresh）
+    set $gw_prefix /https/$up_target;
+    proxy_redirect ~*^(http|https)://[^/]+(.*)$ $scheme://$host$gw_prefix$2;
+    proxy_redirect ~^//[^/]+(.*)$ $scheme://$host$gw_prefix$1;
+    proxy_redirect ~^(/.*)$ $gw_prefix$1;
+
+
     proxy_ssl_server_name on;
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
@@ -727,6 +741,13 @@ __ALLOW_SNIP__
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
+
+    # 保持重定向仍走网关（proxy_pass 使用变量时，nginx 默认不会改写 Location/Refresh）
+    set $gw_prefix /$up_target;
+    proxy_redirect ~*^(http|https)://[^/]+(.*)$ $scheme://$host$gw_prefix$2;
+    proxy_redirect ~^//[^/]+(.*)$ $scheme://$host$gw_prefix$1;
+    proxy_redirect ~^(/.*)$ $gw_prefix$1;
+
 
     proxy_ssl_server_name on;
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
