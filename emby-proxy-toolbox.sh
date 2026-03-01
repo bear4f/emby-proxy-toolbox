@@ -19,6 +19,7 @@ GW_SNIP_CONF="/etc/nginx/snippets/emby-gw-locations.conf"
 GW_HTPASSWD="/etc/nginx/.htpasswd-emby-gw"
 
 TOOL_NAME="emby-proxy-toolbox"
+KEEP_BACKUPS="${KEEP_BACKUPS:-5}"
 # ------------------------------------------------
 
 need_root() { [[ "${EUID}" -eq 0 ]] || { echo "请用 root 运行：sudo bash $0"; exit 1; }; }
