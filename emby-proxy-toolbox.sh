@@ -7,6 +7,7 @@ set -euo pipefail
 SITES_AVAIL="/etc/nginx/sites-available"
 SITES_ENAB="/etc/nginx/sites-enabled"
 BACKUP_ROOT="/root"
+BACKUP_KEEP="2"
 
 # 单站管理器
 SINGLE_PREFIX="emby-"
@@ -23,6 +24,53 @@ TOOL_NAME="emby-proxy-toolbox"
 
 need_root() { [[ "${EUID}" -eq 0 ]] || { echo "请用 root 运行：sudo bash $0"; exit 1; }; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# ---- backup helpers (avoid .bak recursion; keep last ${BACKUP_KEEP}) ----
+is_bak_path() { [[ "$1" == *".bak."* || "$1" == *.bak ]]; }
+bak_base_path() { local p="$1"; echo "${p%%.bak.*}"; }
+
+prune_baks_for_base() {
+  local base="$1" keep="${2:-2}"
+  shopt -s nullglob
+  local arr=("${base}.bak."*)
+  shopt -u nullglob
+  (( ${#arr[@]} <= keep )) && return 0
+  # sort by mtime desc
+  mapfile -t arr < <(ls -1t "${base}.bak."* 2>/dev/null)
+  local i
+  for ((i=keep; i<${#arr[@]}; i++)); do
+    rm -f "${arr[$i]}" 2>/dev/null || true
+  done
+}
+
+backup_inplace() {
+  local p="$1"
+  [[ -e "$p" ]] || return 0
+  # never backup backup-of-backup
+  if is_bak_path "$p"; then return 0; fi
+
+  local base; base="$(bak_base_path "$p")"
+  local ts; ts="$(date +%F_%H%M%S)"
+  local bak="${base}.bak.${ts}"
+
+  cp -a "$base" "$bak"
+  prune_baks_for_base "$base" "${BACKUP_KEEP}"
+}
+
+prune_backup_dirs() {
+  local prefix="$1" keep="${2:-2}"
+  shopt -s nullglob
+  local dirs=("${BACKUP_ROOT}/${prefix}"*)
+  shopt -u nullglob
+  (( ${#dirs[@]} <= keep )) && return 0
+  mapfile -t dirs < <(ls -1dt "${BACKUP_ROOT}/${prefix}"* 2>/dev/null)
+  local i
+  for ((i=keep; i<${#dirs[@]}; i++)); do
+    rm -rf "${dirs[$i]}" 2>/dev/null || true
+  done
+}
+# -----------------------------------------------------------------------
+
 
 prompt() {
   local __var="$1" __msg="$2" __def="${3:-}"
@@ -80,6 +128,7 @@ backup_nginx() {
   dir="${BACKUP_ROOT}/nginx-backup-${ts}"
   mkdir -p "$dir/nginx"
   rsync -a /etc/nginx/ "$dir/nginx/"
+  prune_backup_dirs "nginx-backup-" "${BACKUP_KEEP}"
   echo "$dir"
 }
 restore_nginx() { local dir="$1"; rsync -a --delete "$dir/nginx/" /etc/nginx/; }
@@ -127,7 +176,7 @@ nginx_self_heal_compat() {
 
   # 注释 $http3
   local http3_files
-  http3_files="$(grep -RIl '\$http3\b' /etc/nginx 2>/dev/null || true)"
+  http3_files="$(grep -RIl --exclude='*.bak*' '\$http3' /etc/nginx 2>/dev/null || true)"
   if [[ -n "$http3_files" ]]; then
     while read -r f; do
       [[ -z "$f" ]] && continue
@@ -357,19 +406,9 @@ EOF
 }
 
 single_print_usage_hint() {
-  local domain="$1"
-  local entry_port="${2:-80}"
-  local subpath="$3"
-  local enable_ssl="$4"
-  local ports_csv="$5"
-
-  local main
-  if [[ "$enable_ssl" == "y" ]]; then
-    main="https://${domain}"
-  else
-    main="http://${domain}"
-    [[ "$entry_port" != "80" ]] && main="${main}:${entry_port}"
-  fi
+  local domain="$1" subpath="$2" enable_ssl="$3" ports_csv="$4"
+  local main="http://${domain}"
+  [[ "$enable_ssl" == "y" ]] && main="https://${domain}"
   if [[ "$subpath" != "/" && -n "$subpath" ]]; then main="${main}${subpath}"; else main="${main}/"; fi
 
   echo
@@ -395,15 +434,13 @@ single_print_usage_hint() {
 }
 
 single_action_add_or_edit() {
-  local DOMAIN ENTRY_HTTP_PORT ORIGIN_HOST ORIGIN_PORT ORIGIN_SCHEME
+  local DOMAIN ORIGIN_HOST ORIGIN_PORT ORIGIN_SCHEME
   local ENABLE_SSL EMAIL ENABLE_UFW
   local ENABLE_BASICAUTH BASIC_USER BASIC_PASS
   local USE_SUBPATH SUBPATH UPSTREAM_INSECURE EXTRA_PORTS
 
   prompt DOMAIN "访问域名（只填域名，不要 https://）"
   DOMAIN="$(strip_scheme "$DOMAIN")"
-  prompt ENTRY_HTTP_PORT "主入口 HTTP 监听端口（NAT 机器填映射端口；默认 80）" "80"
-  is_port "$ENTRY_HTTP_PORT" || { echo "端口不合法：$ENTRY_HTTP_PORT"; return 1; }
   prompt ORIGIN_HOST "源站域名或IP（可误输 http(s)://，会自动去掉）"
   ORIGIN_HOST="$(strip_scheme "$ORIGIN_HOST")"
   prompt ORIGIN_PORT "源站端口" "8096"
@@ -412,11 +449,6 @@ single_action_add_or_edit() {
   [[ "$ORIGIN_SCHEME" == "http" || "$ORIGIN_SCHEME" == "https" ]] || { echo "协议只能是 http 或 https"; return 1; }
 
   yesno ENABLE_SSL "为主入口申请 Let's Encrypt（启用 443 并 80->443）" "y"
-  if [[ "$ENABLE_SSL" == "y" && "$ENTRY_HTTP_PORT" != "80" ]]; then
-    echo "⚠️  Let's Encrypt（HTTP-01）必须外网 80 可访问；你选择了端口 $ENTRY_HTTP_PORT。"
-    echo "    已自动关闭 Let's Encrypt：将仅部署 HTTP 入口。"
-    ENABLE_SSL="n"
-  fi
   EMAIL="admin@${DOMAIN}"
   [[ "$ENABLE_SSL" == "y" ]] && prompt EMAIL "证书邮箱" "$EMAIL"
 
@@ -477,7 +509,7 @@ single_action_add_or_edit() {
   trap 'rm -f "$dump"' RETURN
 
   set +e
-  single_write_site_conf "$DOMAIN" "$ENTRY_HTTP_PORT" "$ORIGIN_HOST" "$ORIGIN_PORT" "$ORIGIN_SCHEME" \
+  single_write_site_conf "$DOMAIN" "$ORIGIN_HOST" "$ORIGIN_PORT" "$ORIGIN_SCHEME" \
     "$ENABLE_BASICAUTH" "$BASIC_USER" "$BASIC_PASS" \
     "$USE_SUBPATH" "$SUBPATH" \
     "$UPSTREAM_INSECURE" "$EXTRA_PORTS"
@@ -494,8 +526,8 @@ single_action_add_or_edit() {
 
   if [[ "$ENABLE_UFW" == "y" ]]; then
     if ! has_cmd ufw; then apt_install ufw; fi
-    ufw allow ${ENTRY_HTTP_PORT}/tcp >/dev/null || true
-    [[ "$ENABLE_SSL" == "y" ]] && ufw allow 443/tcp >/dev/null || true
+    ufw allow 80/tcp >/dev/null || true
+    ufw allow 443/tcp >/dev/null || true
     if [[ -n "${EXTRA_PORTS// /}" ]]; then
       IFS=',' read -r -a arr <<<"$EXTRA_PORTS"
       for p in "${arr[@]}"; do [[ -z "$p" ]] && continue; ufw allow "${p}/tcp" >/dev/null || true; done
@@ -520,7 +552,7 @@ single_action_add_or_edit() {
   echo "站点配置：$(single_conf_path_for_domain "$DOMAIN")"
   echo "备份目录：$backup"
   [[ "$USE_SUBPATH" == "y" ]] && echo "⚠️ 子路径：建议在 Emby 后台 Base URL 设置为 $SUBPATH 并重启 Emby。"
-  single_print_usage_hint "$DOMAIN" "$ENTRY_HTTP_PORT" "$SUBPATH" "$ENABLE_SSL" "$EXTRA_PORTS"
+  single_print_usage_hint "$DOMAIN" "$SUBPATH" "$ENABLE_SSL" "$EXTRA_PORTS"
 }
 
 single_action_list() {
@@ -683,9 +715,6 @@ __ALLOW_SNIP__
     proxy_set_header X-Forwarded-Proto $scheme;
 
     proxy_ssl_server_name on;
-    # Rewrite absolute redirects back to gateway (variable proxy_pass won't do it automatically)
-    proxy_redirect ~^http://([^/]+)(/.*)$  $scheme://$host/http/$1$2;
-    proxy_redirect ~^https://([^/]+)(/.*)$ $scheme://$host/http/$1$2;
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
 
@@ -703,9 +732,6 @@ __ALLOW_SNIP__
     proxy_set_header X-Forwarded-Proto $scheme;
 
     proxy_ssl_server_name on;
-    # Rewrite absolute redirects back to gateway (variable proxy_pass won't do it automatically)
-    proxy_redirect ~^https://([^/]+)(/.*)$ $scheme://$host/https/$1$2;
-    proxy_redirect ~^http://([^/]+)(/.*)$  $scheme://$host/https/$1$2;
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
 
@@ -723,9 +749,6 @@ __ALLOW_SNIP__
     proxy_set_header X-Forwarded-Proto $scheme;
 
     proxy_ssl_server_name on;
-    # Rewrite absolute redirects back to gateway (variable proxy_pass won't do it automatically)
-    proxy_redirect ~^https://([^/]+)(/.*)$ $scheme://$host/$1$2;
-    proxy_redirect ~^http://([^/]+)(/.*)$  $scheme://$host/http/$1$2;
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
 EOF
@@ -749,7 +772,6 @@ EOF
 
 gw_write_site_conf() {
   local domain="$1"
-  local http_port="$2"
   local conf enabled
   conf="$(gw_conf_path_for_domain "$domain")"
   enabled="$(gw_enabled_path_for_domain "$domain")"
@@ -759,8 +781,8 @@ gw_write_site_conf() {
 # Managed by ${TOOL_NAME}
 
 server {
-  listen ${http_port};
-  listen [::]:${http_port};
+  listen 80;
+  listen [::]:80;
   server_name ${domain};
 
   location ^~ /.well-known/acme-challenge/ {
@@ -782,53 +804,37 @@ EOF
 }
 
 gw_print_usage() {
-  local domain="$1"
-  local ssl="$2"
-  local user="${3:-}"
-  local pass="${4:-}"
-  local http_port="${5:-80}"
-
-  local base
-  if [[ "$ssl" == "y" ]]; then
-    base="https://${domain}"
+  local domain="$1" ssl="$2" user="${3:-}" pass="${4:-}"
+  local base="http://${domain}"; [[ "$ssl" == "y" ]] && base="https://${domain}"
+  echo
+  echo "================ 通用网关用法 ================"
+  echo "在 Emby 客户端服务器地址中填写："
+  echo "  ${base}/<上游主机:端口>        （默认按 https 回源）"
+  echo "  ${base}/http/<上游主机:端口>   （强制 http 回源）"
+  echo
+  echo "示例（仅示意，非真实地址）："
+  echo "  ${base}/example.com:443"
+  echo "  ${base}/http/203.0.113.10:8096"
+  echo
+  if [[ -n "$user" ]]; then
+    echo "已开启 BasicAuth（网关额外门禁；不影响上游 Emby 自身账号密码）："
+    echo "  用户名: $user"
+    echo "  密码:   $pass"
+    echo "注意：部分客户端（如某些 SenPlayer/Forward 组合）不支持 BasicAuth，会导致无法使用。"
   else
-    base="http://${domain}"
-    [[ "$http_port" != "80" ]] && base="${base}:${http_port}"
+    echo "未开启 BasicAuth。"
   fi
-
-  echo
-  echo "================ 使用方法 ================"
-  echo "网关已就绪：${base}/"
-  if [[ "$user" != "" || "$pass" != "" ]]; then
-    echo
-    echo "BasicAuth：${user}:${pass}"
-  fi
-  echo
-  echo "在 Emby 客户端服务器地址里填写（按需选择回源协议）："
-  echo "  - 默认（HTTPS 回源）：${base}/emby.example.com:443"
-  echo "  - 强制 HTTP 回源：    ${base}/http/203.0.113.10:8096"
-  echo "  - 显式 HTTPS 回源：   ${base}/https/emby.example.com:443"
-  echo
-  echo "⚠️  强烈建议开启 BasicAuth 或 IP 白名单，避免开放代理风险。"
-  echo "=========================================="
+  echo "=============================================="
   echo
 }
 
 gw_action_install_update() {
-  local DOMAIN GW_HTTP_PORT ENABLE_SSL EMAIL ENABLE_BASICAUTH BASIC_USER BASIC_PASS ENABLE_IPWL IPWL ok
+  local DOMAIN ENABLE_SSL EMAIL ENABLE_BASICAUTH BASIC_USER BASIC_PASS ENABLE_IPWL IPWL ok
   prompt DOMAIN "你的网关入口域名（例如 autoemby.example.com；只填域名，不要 https://）"
   DOMAIN="$(strip_scheme "$DOMAIN")"
   [[ -n "$DOMAIN" ]] || { echo "域名不能为空"; return 1; }
 
-  prompt GW_HTTP_PORT "网关 HTTP 监听端口（NAT 机器填映射端口；默认 80）" "80"
-  is_port "$GW_HTTP_PORT" || { echo "端口不合法：$GW_HTTP_PORT"; return 1; }
-
   yesno ENABLE_SSL "为网关域名申请 Let's Encrypt（启用 443 并 80->443）" "y"
-  if [[ "$ENABLE_SSL" == "y" && "$GW_HTTP_PORT" != "80" ]]; then
-    echo "⚠️  Let's Encrypt（HTTP-01）必须外网 80 可访问；你选择了端口 $GW_HTTP_PORT。"
-    echo "    已自动关闭 Let's Encrypt：将仅部署 HTTP 网关。"
-    ENABLE_SSL="n"
-  fi
   EMAIL="admin@${DOMAIN}"
   [[ "$ENABLE_SSL" == "y" ]] && prompt EMAIL "证书邮箱" "$EMAIL"
 
@@ -878,7 +884,7 @@ gw_action_install_update() {
 
   gw_write_map_conf
   gw_write_locations_snippet "$ENABLE_BASICAUTH" "$ENABLE_IPWL" "$IPWL"
-  gw_write_site_conf "$DOMAIN" "$GW_HTTP_PORT"
+  gw_write_site_conf "$DOMAIN"
 
   apply_with_rollback "$backup" "$dump" || return 1
 
@@ -899,7 +905,7 @@ gw_action_install_update() {
   echo "✅ 网关已生效：$DOMAIN"
   echo "站点配置：$(gw_conf_path_for_domain "$DOMAIN")"
   echo "备份目录：$backup"
-  if [[ "$ENABLE_BASICAUTH" == "y" ]]; then gw_print_usage "$DOMAIN" "$ENABLE_SSL" "$BASIC_USER" "$BASIC_PASS" "$GW_HTTP_PORT"; else gw_print_usage "$DOMAIN" "$ENABLE_SSL" "" "" "$GW_HTTP_PORT"; fi
+  if [[ "$ENABLE_BASICAUTH" == "y" ]]; then gw_print_usage "$DOMAIN" "$ENABLE_SSL" "$BASIC_USER" "$BASIC_PASS"; else gw_print_usage "$DOMAIN" "$ENABLE_SSL"; fi
 }
 
 gw_action_status() {
