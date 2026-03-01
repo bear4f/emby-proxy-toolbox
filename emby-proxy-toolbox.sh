@@ -3,6 +3,9 @@
 # 一体化 Emby 反代工具箱（单站反代管理器 + 通用反代网关）
 set -euo pipefail
 
+
+# Backup retention (keep last N backups). You can override by exporting KEEP_BACKUPS.
+KEEP_BACKUPS="${KEEP_BACKUPS:-2}"
 # -------------------- 通用配置 --------------------
 SITES_AVAIL="/etc/nginx/sites-available"
 SITES_ENAB="/etc/nginx/sites-enabled"
@@ -99,6 +102,17 @@ prune_file_backups() {
 }
 
 
+prune_existing_nginx_baks() {
+  # Keep backups under /etc/nginx tidy: for each <file>.bak.<ts> keep last $KEEP_BACKUPS.
+  local f base
+  while IFS= read -r -d '' f; do
+    base="${f%%.bak.*}"
+    [[ -f "$base" ]] || continue
+    prune_file_backups "$base" "$KEEP_BACKUPS"
+  done < <(find /etc/nginx -type f -name "*.bak.*" -print0 2>/dev/null || true)
+}
+
+
 backup_nginx() {
   local ts dir
   ts="$(date +%Y%m%d_%H%M%S)"
@@ -157,6 +171,7 @@ nginx_self_heal_compat() {
   if [[ -n "$http3_files" ]]; then
     while read -r f; do
       [[ -z "$f" ]] && continue
+    [[ "$f" == *".bak."* || "$f" == *.bak ]] && continue
       cp -a "$f" "${f}.bak.${ts}"
     prune_file_backups "$f" "$KEEP_BACKUPS"
       sed -i '/\$http3\b/s/^/# /' "$f"
