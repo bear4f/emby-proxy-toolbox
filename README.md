@@ -40,8 +40,6 @@
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/bear4f/emby-proxy-toolbox/main/emby-proxy-toolbox.sh)"
 ````
 
-> 将 `<YOUR_GH_USER>/<YOUR_REPO>` 替换成你的仓库路径。
-
 ### 方式 B：下载后运行
 
 ```bash
