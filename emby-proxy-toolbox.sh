@@ -25,10 +25,40 @@ TOOL_NAME="emby-proxy-toolbox"
 KEEP_BACKUPS="${KEEP_BACKUPS:-2}"
 
 _on_err(){ echo "❌ 脚本出错：第 ${1} 行：${2}" >&2; }
-trap \'_on_err "${LINENO}" "${BASH_COMMAND}"\' ERR
-
+trap '_on_err "${LINENO}" "${BASH_COMMAND}"' ERR
 need_root() { [[ "${EUID}" -eq 0 ]] || { echo "请用 root 运行：sudo bash $0"; exit 1; }; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+
+backup_copy() {
+  # Safe backup helper: never chain .bak names; keep only last KEEP_BACKUPS backups per base.
+  local src="$1"
+  local tag="${2:-bak}"
+  local ts base real dst
+
+  ts="$(date +%F_%H%M%S)"
+
+  # Strip any existing .bak* to get base name
+  base="${src%%.bak*}"
+  [[ -z "$base" ]] && base="$src"
+
+  # Prefer backing up the real base file if it exists
+  real="$base"
+  if [[ ! -f "$real" && ! -L "$real" ]]; then
+    real="$src"
+  fi
+
+  # Final base for naming
+  base="${real%%.bak*}"
+  [[ -z "$base" ]] && base="$real"
+
+  dst="${base}.bak.${tag}.${ts}"
+  cp -a "$real" "$dst" 2>/dev/null || cp -a "$src" "$dst"
+
+  # prune old backups for this base
+  prune_file_backups "$base" "$KEEP_BACKUPS" || true
+}
+
 
 prompt() {
   local __var="$1" __msg="$2" __def="${3:-}"
@@ -142,8 +172,7 @@ ensure_sites_enabled_include() {
   [[ -f "$main" ]] || return 0
   grep -qE 'include\s+/etc/nginx/sites-enabled/\*;' "$main" && return 0
 
-  cp -a "$main" "${main}.bak.$(date +%F_%H%M%S)"
-  prune_file_backups "$main" "$KEEP_BACKUPS"
+  backup_copy "$main" "ensure_include"
   if grep -qE 'include\s+/etc/nginx/conf\.d/\*\.conf;' "$main"; then
     sed -i '/include\s\+\/etc\/nginx\/conf\.d\/\*\.conf;/a\    include /etc/nginx/sites-enabled/*;' "$main"
   else
@@ -165,18 +194,14 @@ nginx_self_heal_compat() {
     while read -r f; do
       [[ -z "$f" ]] && continue
       [[ "$f" == *.bak* ]] && continue
-      cp -a "$f" "${f}.bak.${ts}"
-      prune_file_backups "$f" "$KEEP_BACKUPS"
-      sed -i '/\$http3\b/s/^/# /' "$f"
+      backup_copy "$f" "compat"sed -i '/\$http3\b/s/^/# /' "$f"
     done <<< "$http3_files"
     changed="y"
   fi
 
   # 注释 quic/http3/ssl_reject_handshake
   if grep -qiE '\b(quic_bpf|http3|ssl_reject_handshake)\b' "$main"; then
-    cp -a "$main" "${main}.bak.${ts}"
-  prune_file_backups "$main" "$KEEP_BACKUPS"
-    sed -i -E '
+    backup_copy "$main" "compat"sed -i -E '
       s/^\s*quic_bpf\b/# quic_bpf/;
       s/^\s*http3\b/# http3/;
       s/^\s*ssl_reject_handshake\b/# ssl_reject_handshake/;
@@ -198,9 +223,7 @@ nginx_self_heal_compat() {
       }
       END{exit 0;}
     ' "$main"; then
-      cp -a "$main" "${main}.bak.${ts}"
-  prune_file_backups "$main" "$KEEP_BACKUPS"
-      awk '
+      backup_copy "$main" "compat"awk '
         BEGIN{state=0;lvl=0;match=0;}
         {
           if (state==0 && $0 ~ /server[[:space:]]*\{/){
