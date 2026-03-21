@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # emby-proxy-toolbox.sh
 # 一体化 Emby 反代工具箱（单站反代管理器 + 通用反代网关）
-set -Eeuo pipefail
+set -euo pipefail
+
+# 备份保留份数（默认 2）
+KEEP_BACKUPS="${KEEP_BACKUPS:-2}"
+
 
 # -------------------- 通用配置 --------------------
 SITES_AVAIL="/etc/nginx/sites-available"
@@ -21,44 +25,8 @@ GW_HTPASSWD="/etc/nginx/.htpasswd-emby-gw"
 TOOL_NAME="emby-proxy-toolbox"
 # ------------------------------------------------
 
-# 默认仅保留最近 2 份备份（可通过环境变量 KEEP_BACKUPS 覆盖）
-KEEP_BACKUPS="${KEEP_BACKUPS:-2}"
-
-_on_err(){ echo "❌ 脚本出错：第 ${1} 行：${2}" >&2; }
-trap '_on_err "${LINENO}" "${BASH_COMMAND}"' ERR
 need_root() { [[ "${EUID}" -eq 0 ]] || { echo "请用 root 运行：sudo bash $0"; exit 1; }; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-
-backup_copy() {
-  # Safe backup helper: never chain .bak names; keep only last KEEP_BACKUPS backups per base.
-  local src="$1"
-  local tag="${2:-bak}"
-  local ts base real dst
-
-  ts="$(date +%F_%H%M%S)"
-
-  # Strip any existing .bak* to get base name
-  base="${src%%.bak*}"
-  [[ -z "$base" ]] && base="$src"
-
-  # Prefer backing up the real base file if it exists
-  real="$base"
-  if [[ ! -f "$real" && ! -L "$real" ]]; then
-    real="$src"
-  fi
-
-  # Final base for naming
-  base="${real%%.bak*}"
-  [[ -z "$base" ]] && base="$real"
-
-  dst="${base}.bak.${tag}.${ts}"
-  cp -a "$real" "$dst" 2>/dev/null || cp -a "$src" "$dst"
-
-  # prune old backups for this base
-  prune_file_backups "$base" "$KEEP_BACKUPS" || true
-}
-
 
 prompt() {
   local __var="$1" __msg="$2" __def="${3:-}"
@@ -110,38 +78,12 @@ ensure_htpasswd_cmd() {
   fi
 }
 
-prune_nginx_backup_dirs() {
-  # 保留最近 keep 份 /root/nginx-backup-* 目录
-  local keep="${1:-$KEEP_BACKUPS}"
-  [[ "$keep" =~ ^[0-9]+$ ]] || keep="$KEEP_BACKUPS"
-  (( keep >= 1 )) || keep=1
-  ls -1dt "${BACKUP_ROOT}/nginx-backup-"* 2>/dev/null | tail -n +$((keep+1)) | while read -r d; do
-    [[ -n "$d" ]] || continue
-    rm -rf -- "$d" 2>/dev/null || true
-  done
-}
-
-prune_file_backups() {
-  # 保留最近 keep 份 <file>.bak.<ts> 备份
-  local base="$1"
-  local keep="${2:-$KEEP_BACKUPS}"
-  [[ -n "$base" ]] || return 0
-  [[ "$keep" =~ ^[0-9]+$ ]] || keep="$KEEP_BACKUPS"
-  (( keep >= 1 )) || keep=1
-  ls -1dt "${base}.bak."* 2>/dev/null | tail -n +$((keep+1)) | while read -r f; do
-    [[ -n "$f" ]] || continue
-    rm -f -- "$f" 2>/dev/null || true
-  done
-}
-
-
 backup_nginx() {
   local ts dir
   ts="$(date +%Y%m%d_%H%M%S)"
   dir="${BACKUP_ROOT}/nginx-backup-${ts}"
   mkdir -p "$dir/nginx"
   rsync -a /etc/nginx/ "$dir/nginx/"
-  prune_nginx_backup_dirs "$KEEP_BACKUPS"
   echo "$dir"
 }
 restore_nginx() { local dir="$1"; rsync -a --delete "$dir/nginx/" /etc/nginx/; }
@@ -172,7 +114,7 @@ ensure_sites_enabled_include() {
   [[ -f "$main" ]] || return 0
   grep -qE 'include\s+/etc/nginx/sites-enabled/\*;' "$main" && return 0
 
-  backup_copy "$main" "ensure_include"
+  cp -a "$main" "${main}.bak.$(date +%F_%H%M%S)"
   if grep -qE 'include\s+/etc/nginx/conf\.d/\*\.conf;' "$main"; then
     sed -i '/include\s\+\/etc\/nginx\/conf\.d\/\*\.conf;/a\    include /etc/nginx/sites-enabled/*;' "$main"
   else
@@ -189,19 +131,20 @@ nginx_self_heal_compat() {
 
   # 注释 $http3
   local http3_files
-  http3_files="$(grep -RIl '\$http3\b' /etc/nginx --exclude='*.bak*' --exclude-dir='nginx-backup-*' --exclude-dir='backup*' 2>/dev/null || true)"
+  http3_files="$(grep -RIl '\$http3\b' /etc/nginx 2>/dev/null || true)"
   if [[ -n "$http3_files" ]]; then
     while read -r f; do
       [[ -z "$f" ]] && continue
-      [[ "$f" == *.bak* ]] && continue
-      backup_copy "$f" "compat"sed -i '/\$http3\b/s/^/# /' "$f"
+      cp -a "$f" "${f}.bak.${ts}"
+      sed -i '/\$http3\b/s/^/# /' "$f"
     done <<< "$http3_files"
     changed="y"
   fi
 
   # 注释 quic/http3/ssl_reject_handshake
   if grep -qiE '\b(quic_bpf|http3|ssl_reject_handshake)\b' "$main"; then
-    backup_copy "$main" "compat"sed -i -E '
+    cp -a "$main" "${main}.bak.${ts}"
+    sed -i -E '
       s/^\s*quic_bpf\b/# quic_bpf/;
       s/^\s*http3\b/# http3/;
       s/^\s*ssl_reject_handshake\b/# ssl_reject_handshake/;
@@ -223,7 +166,8 @@ nginx_self_heal_compat() {
       }
       END{exit 0;}
     ' "$main"; then
-      backup_copy "$main" "compat"awk '
+      cp -a "$main" "${main}.bak.${ts}"
+      awk '
         BEGIN{state=0;lvl=0;match=0;}
         {
           if (state==0 && $0 ~ /server[[:space:]]*\{/){
@@ -269,6 +213,35 @@ certbot_enable_tls() {
   certbot --nginx -d "$domain" --agree-tos -m "$email" --non-interactive --redirect
 }
 
+certbot_issue_webroot() {
+  # issue/renew cert without modifying nginx configs
+  local domain="$1" email="$2"
+  ensure_certbot
+  mkdir -p /var/www/html
+  certbot certonly --webroot -w /var/www/html -d "$domain" \
+    --agree-tos -m "$email" --non-interactive --keep-until-expiring >/dev/null
+}
+
+disable_conflicting_server_name() {
+  # move other enabled vhosts that use the same server_name to avoid conflict
+  local domain="$1"
+  local ts dir
+  ts="$(date +%Y%m%d_%H%M%S)"
+  dir="/root/nginx-disabled-${ts}"
+  mkdir -p "$dir"
+
+  local f
+  for f in /etc/nginx/sites-enabled/*.conf /etc/nginx/conf.d/*.conf; do
+    [[ -e "$f" ]] || continue
+    [[ "$f" == *"${GW_PREFIX}"*"${domain}"* ]] && continue
+    # skip backups
+    [[ "$f" == *.bak* ]] && continue
+    if grep -qE "^\s*server_name\s+.*\b${domain}\b" "$f" 2>/dev/null; then
+      echo "⚠️ 检测到冲突站点（同域名 server_name）：$f -> $dir/"
+      mv "$f" "$dir/" 2>/dev/null || true
+    fi
+  done
+}
 random_pass() { openssl rand -hex 10 2>/dev/null; }
 
 # ========================= 单站反代 =========================
@@ -386,8 +359,8 @@ map \$http_upgrade \$connection_upgrade {
 }
 
 server {
-  listen ${http_port};
-  listen [::]:${http_port};
+  listen 80;
+  listen [::]:80;
   server_name ${domain};
 
 ${location_block}
@@ -463,12 +436,6 @@ single_action_add_or_edit() {
   EMAIL="admin@${DOMAIN}"
   [[ "$ENABLE_SSL" == "y" ]] && prompt EMAIL "证书邮箱" "$EMAIL"
 
-  if [[ "$ENABLE_SSL" == "y" && "$HTTP_PORT" != "80" ]]; then
-    echo "⚠️ 提示：你选择的网关 HTTP 端口不是 80（当前为 $HTTP_PORT）。"
-    echo "    Let's Encrypt 的 HTTP-01 验证必须从外网访问 80 端口，因此将自动关闭证书申请。"
-    ENABLE_SSL="n"
-  fi
-
   yesno ENABLE_UFW "自动用 UFW 放通 80/443 + 额外端口（不影响云安全组）" "n"
 
   yesno ENABLE_BASICAUTH "启用 BasicAuth（额外一层门禁，可选）" "n"
@@ -523,7 +490,7 @@ single_action_add_or_edit() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap '[[ -n "${dump:-}" ]] && rm -f "$dump"; trap - RETURN' RETURN
+  trap 'rm -f "$dump"' RETURN
 
   set +e
   single_write_site_conf "$DOMAIN" "$ORIGIN_HOST" "$ORIGIN_PORT" "$ORIGIN_SCHEME" \
@@ -616,7 +583,7 @@ single_action_delete() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap '[[ -n "${dump:-}" ]] && rm -f "$dump"; trap - RETURN' RETURN
+  trap 'rm -f "$dump"' RETURN
 
   rm -f "$enabled" "$conf"
   apply_with_rollback "$backup" "$dump" || return 1
@@ -686,55 +653,63 @@ gw_write_locations_snippet() {
 
   local auth_snip="" allow_snip=""
   if [[ "$enable_basicauth" == "y" ]]; then
-    auth_snip=$'    auth_basic "Restricted";\n    auth_basic_user_file /etc/nginx/.htpasswd-emby-gw;\n'
+    auth_snip=$'    auth_basic "Restricted";
+    auth_basic_user_file /etc/nginx/.htpasswd-emby-gw;
+'
   fi
   if [[ "$enable_ip_whitelist" == "y" ]]; then
     local csv="${whitelist_csv// /}"
     IFS=',' read -r -a arr <<<"$csv"
-    for cidr in "${arr[@]}"; do [[ -z "$cidr" ]] && continue; allow_snip+="    allow ${cidr};\n"; done
-    allow_snip+="    deny all;\n"
+    for cidr in "${arr[@]}"; do [[ -z "$cidr" ]] && continue; allow_snip+="    allow ${cidr};
+"; done
+    allow_snip+="    deny all;
+"
   fi
 
   cat > "$GW_SNIP_CONF" <<'EOF'
 # Managed by emby-proxy-toolbox (universal gateway)
 # Included inside server{} (这里不能出现 map 指令)
 
-proxy_http_version 1.1;
+# --- websocket ---
+map $http_upgrade $connection_upgrade {
+  default upgrade;
+  ""      close;
+}
 
+proxy_http_version 1.1;
 proxy_set_header Upgrade $http_upgrade;
 proxy_set_header Connection $connection_upgrade;
 
+# --- range streaming ---
 proxy_set_header Range $http_range;
 proxy_set_header If-Range $http_if_range;
 
+# --- timeouts ---
 proxy_buffering off;
 proxy_request_buffering off;
-
 proxy_read_timeout 3600s;
 proxy_send_timeout 3600s;
-
 client_max_body_size 500m;
 
-resolver 1.1.1.1 8.8.8.8 223.5.5.5 119.29.29.29 valid=60s;
+# Nginx variable upstream needs resolver
+resolver 1.1.1.1 8.8.8.8 valid=60s;
 resolver_timeout 5s;
 
+# 规范化：避免 Location: web/index.html 这类相对跳转把 target 丢了
+location ~ ^/http/(?<t>[A-Za-z0-9.\-_\[\]:]+)$  { return 301 /http/$t/; }
+location ~ ^/https/(?<t>[A-Za-z0-9.\-_\[\]:]+)$ { return 301 /https/$t/; }
+location ~ ^/(?<t>[A-Za-z0-9.\-_\[\]:]+)$      { return 301 /$t/; }
+
+# ---------------- /http/<target>/... ----------------
 location ~ ^/http/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
     set $up_scheme http;
     if ($up_rest = "") { set $up_rest "/"; }
+    set $gw_prefix /http/$up_target;
 
 __AUTH_SNIP__
 __ALLOW_SNIP__
 
-    # 防止上游通过 Location/跳转让客户端直连源站（尤其是 http 源站）
-    proxy_redirect off;
-    # Location: web/index.html （不以 / 开头的相对跳转）
-    proxy_redirect ~^([^/].*)$ /http/$up_target/$1;
-    # Location: /web/index.html （以 / 开头的相对跳转）
-    proxy_redirect ~^/(.*)$ /http/$up_target/$1;
-    # Location: http(s)://upstream/... （绝对跳转）
-    proxy_redirect ~^http://([^/]+)(/.*)$  /http/$1$2;
-    proxy_redirect ~^https://([^/]+)(/.*)$ /https/$1$2;
-
+    # Host for upstream (avoid 421 on CF-backed origins)
     proxy_set_header Host $up_host_only;
     proxy_set_header X-Forwarded-Host $host;
     proxy_set_header X-Real-IP $remote_addr;
@@ -742,20 +717,31 @@ __ALLOW_SNIP__
     proxy_set_header X-Forwarded-Proto $scheme;
 
     proxy_ssl_server_name on;
+
+    # 关键：把上游 redirect 改写回网关，避免客户端跟跳转直连源站
+    proxy_redirect off;
+    # 若已是网关自身的绝对跳转，保持（避免 double-prefix）
+    proxy_redirect ~^https?://$host(/.*)$ $1;
+    # 若已是 /http|/https 前缀，保持
+    proxy_redirect ~^/(http|https)/.*$ $0;
+    # 绝对跳转（http/https）统一改为网关前缀
+    proxy_redirect ~^https?://[^/]+(/.*)$ $gw_prefix$1;
+    # 以 / 开头的相对跳转
+    proxy_redirect ~^/(.*)$ $gw_prefix/$1;
+    # 不以 / 开头的相对跳转（例如 web/index.html）
+    proxy_redirect ~^([^/].*)$ $gw_prefix/$1;
+
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
 
+# ---------------- /https/<target>/... ----------------
 location ~ ^/https/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
     set $up_scheme https;
     if ($up_rest = "") { set $up_rest "/"; }
+    set $gw_prefix /https/$up_target;
 
 __AUTH_SNIP__
 __ALLOW_SNIP__
-
-    # 处理相对 Location，避免客户端解析丢失目标（不改写绝对跳转以避免循环）
-    proxy_redirect off;
-    proxy_redirect ~^([^/].*)$ /https/$up_target/$1;
-    proxy_redirect ~^/(.*)$ /https/$up_target/$1;
 
     proxy_set_header Host $up_host_only;
     proxy_set_header X-Forwarded-Host $host;
@@ -764,20 +750,25 @@ __ALLOW_SNIP__
     proxy_set_header X-Forwarded-Proto $scheme;
 
     proxy_ssl_server_name on;
+
+    proxy_redirect off;
+    proxy_redirect ~^https?://$host(/.*)$ $1;
+    proxy_redirect ~^/(http|https)/.*$ $0;
+    proxy_redirect ~^https?://[^/]+(/.*)$ $gw_prefix$1;
+    proxy_redirect ~^/(.*)$ $gw_prefix/$1;
+    proxy_redirect ~^([^/].*)$ $gw_prefix/$1;
+
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
 
+# ---------------- default: /<target>/... (defaults to https) ----------------
 location ~ ^/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
     set $up_scheme https;
     if ($up_rest = "") { set $up_rest "/"; }
+    set $gw_prefix /$up_target;
 
 __AUTH_SNIP__
 __ALLOW_SNIP__
-
-    # 处理相对 Location，避免客户端解析丢失目标
-    proxy_redirect off;
-    proxy_redirect ~^([^/].*)$ /$up_target/$1;
-    proxy_redirect ~^/(.*)$ /$up_target/$1;
 
     proxy_set_header Host $up_host_only;
     proxy_set_header X-Forwarded-Host $host;
@@ -786,6 +777,14 @@ __ALLOW_SNIP__
     proxy_set_header X-Forwarded-Proto $scheme;
 
     proxy_ssl_server_name on;
+
+    proxy_redirect off;
+    proxy_redirect ~^https?://$host(/.*)$ $1;
+    proxy_redirect ~^/(http|https)/.*$ $0;
+    proxy_redirect ~^https?://[^/]+(/.*)$ $gw_prefix$1;
+    proxy_redirect ~^/(.*)$ $gw_prefix/$1;
+    proxy_redirect ~^([^/].*)$ $gw_prefix/$1;
+
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
 EOF
@@ -795,29 +794,36 @@ EOF
   if [[ -n "$auth_snip" ]]; then
     awk -v repl="$auth_snip" '{gsub(/__AUTH_SNIP__/, repl); print}' "$GW_SNIP_CONF" > "$tmp"
   else
-    awk '{gsub(/__AUTH_SNIP__\n?/, ""); print}' "$GW_SNIP_CONF" > "$tmp"
+    awk '{gsub(/__AUTH_SNIP__
+?/, ""); print}' "$GW_SNIP_CONF" > "$tmp"
   fi
   mv "$tmp" "$GW_SNIP_CONF"
 
   if [[ -n "$allow_snip" ]]; then
     awk -v repl="$allow_snip" '{gsub(/__ALLOW_SNIP__/, repl); print}' "$GW_SNIP_CONF" > "$tmp"
   else
-    awk '{gsub(/__ALLOW_SNIP__\n?/, ""); print}' "$GW_SNIP_CONF" > "$tmp"
+    awk '{gsub(/__ALLOW_SNIP__
+?/, ""); print}' "$GW_SNIP_CONF" > "$tmp"
   fi
   mv "$tmp" "$GW_SNIP_CONF"
 }
 
 gw_write_site_conf() {
-  local domain="$1"
-  local http_port="${2:-80}"
+  # args: domain http_port enable_ssl
+  local domain="$1" http_port="$2" enable_ssl="$3"
   local conf enabled
   conf="$(gw_conf_path_for_domain "$domain")"
   enabled="$(gw_enabled_path_for_domain "$domain")"
 
-  cat >"$conf" <<EOF
+  # always create webroot for ACME
+  mkdir -p /var/www/html
+
+  if [[ "$enable_ssl" == "y" ]]; then
+    cat >"$conf" <<EOF
 # ${TOOL_NAME} / 通用反代网关：${domain}
 # Managed by ${TOOL_NAME}
 
+# --- HTTP entry (for ACME + redirect) ---
 server {
   listen 80;
   listen [::]:80;
@@ -828,14 +834,74 @@ server {
     try_files \$uri =404;
   }
 
+  location / {
+    return 301 https://\$host\$request_uri;
+  }
+}
+
+# --- Optional extra HTTP port (NAT mapping) ---
+EOF
+    if [[ "$http_port" != "80" ]]; then
+      cat >>"$conf" <<EOF
+server {
+  listen ${http_port};
+  listen [::]:${http_port};
+  server_name ${domain};
+
   location = / {
     default_type text/plain;
-    return 200 "OK\\n\\n通用反代网关使用方式（填写到 Emby 客户端“服务器地址”）：\\n\\n  https://${domain}/<上游主机:端口>\\n  https://${domain}/http/<上游主机:端口>\\n\\n说明：默认按 https 回源；若需要 http 回源用 /http 前缀。\\n\\n安全提示：建议开启 BasicAuth 或 IP 白名单，避免 OPEN PROXY。\\n";
+    return 200 "OK\n\n通用反代网关（HTTP 入口）\n\n  http://${domain}:${http_port}/<上游主机:端口>\n  http://${domain}:${http_port}/http/<上游主机:端口>\n\n注意：此端口为明文 HTTP。\n";
   }
 
-  include /etc/nginx/snippets/emby-gw-locations.conf;
+  include ${GW_SNIP_CONF};
 }
 EOF
+    fi
+
+    cat >>"$conf" <<EOF
+
+# --- HTTPS entry ---
+server {
+  listen 443 ssl;
+  listen [::]:443 ssl;
+  server_name ${domain};
+
+  ssl_certificate     /etc/letsencrypt/live/${domain}/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+
+  location = / {
+    default_type text/plain;
+    return 200 "OK\n\n通用反代网关使用方式（填写到 Emby 客户端“服务器地址”）：\n\n  https://${domain}/<上游主机:端口>\n  https://${domain}/http/<上游主机:端口>\n  https://${domain}/https/<上游主机:端口>\n\n说明：默认按 https 回源；若需要 http 回源用 /http 前缀。\n\n安全提示：建议开启 BasicAuth 或 IP 白名单，避免 OPEN PROXY。\n";
+  }
+
+  include ${GW_SNIP_CONF};
+}
+EOF
+  else
+    # HTTP-only gateway (no TLS)
+    cat >"$conf" <<EOF
+# ${TOOL_NAME} / 通用反代网关：${domain}
+# Managed by ${TOOL_NAME}
+
+server {
+  listen ${http_port};
+  listen [::]:${http_port};
+  server_name ${domain};
+
+  location ^~ /.well-known/acme-challenge/ {
+    root /var/www/html;
+    try_files \$uri =404;
+  }
+
+  location = / {
+    default_type text/plain;
+    return 200 "OK\n\n通用反代网关使用方式（填写到 Emby 客户端“服务器地址”）：\n\n  http://${domain}:${http_port}/<上游主机:端口>\n  http://${domain}:${http_port}/http/<上游主机:端口>\n\n说明：默认按 https 回源；若需要 http 回源用 /http 前缀。\n\n安全提示：建议开启 BasicAuth 或 IP 白名单，避免 OPEN PROXY。\n";
+  }
+
+  include ${GW_SNIP_CONF};
+}
+EOF
+  fi
 
   ln -sf "$conf" "$enabled"
   rm -f "${SITES_ENAB}/default" >/dev/null 2>&1 || true
@@ -867,12 +933,11 @@ gw_print_usage() {
 }
 
 gw_action_install_update() {
-  local DOMAIN ENABLE_SSL EMAIL ENABLE_BASICAUTH BASIC_USER BASIC_PASS ENABLE_IPWL IPWL ok
+  local DOMAIN HTTP_PORT ENABLE_SSL EMAIL ENABLE_BASICAUTH BASIC_USER BASIC_PASS ENABLE_IPWL IPWL ok
   prompt DOMAIN "你的网关入口域名（例如 autoemby.example.com；只填域名，不要 https://）"
   DOMAIN="$(strip_scheme "$DOMAIN")"
   [[ -n "$DOMAIN" ]] || { echo "域名不能为空"; return 1; }
 
-  local HTTP_PORT
   prompt HTTP_PORT "网关 HTTP 监听端口（默认 80；若 NAT 未开放 80 可改为 8080/8880 等）" "80"
   is_port "$HTTP_PORT" || { echo "端口不合法：$HTTP_PORT"; return 1; }
 
@@ -880,10 +945,13 @@ gw_action_install_update() {
   EMAIL="admin@${DOMAIN}"
   [[ "$ENABLE_SSL" == "y" ]] && prompt EMAIL "证书邮箱" "$EMAIL"
 
+  # LE webroot/HTTP-01 needs public port 80. If user sets HTTP_PORT != 80, disable LE to avoid guaranteed failure.
   if [[ "$ENABLE_SSL" == "y" && "$HTTP_PORT" != "80" ]]; then
-    echo "⚠️ 提示：你选择的网关 HTTP 端口不是 80（当前为 $HTTP_PORT）。"
-    echo "    Let's Encrypt 的 HTTP-01 验证必须从外网访问 80 端口，因此将自动关闭证书申请。"
-    ENABLE_SSL="n"
+    echo "⚠️ 提示：Let’s Encrypt（HTTP-01）验证必须从公网访问 80 端口。你选择的 HTTP 端口是 $HTTP_PORT。"
+    echo "   若你的 NAT 没有开放 80，则无法自动申请证书。建议："
+    echo "   1) 把 HTTP 端口保留为 80；或 2) 使用 Cloudflare/Tunnel；或 3) 使用 DNS-01 方式。"
+    yesno ok "仍要继续启用 Let’s Encrypt 吗" "n"
+    [[ "$ok" == "y" ]] || ENABLE_SSL="n"
   fi
 
   yesno ENABLE_BASICAUTH "启用 BasicAuth（强烈建议；但注意部分客户端不支持）" "y"
@@ -921,6 +989,9 @@ gw_action_install_update() {
   ensure_sites_enabled_include
   nginx_self_heal_compat
 
+  # 避免同域名多站点冲突（尤其是单站反代与网关共用同域名时）
+  disable_conflicting_server_name "$DOMAIN"
+
   if [[ "$ENABLE_BASICAUTH" == "y" ]]; then
     ensure_htpasswd_cmd
     htpasswd -bc "$GW_HTPASSWD" "$BASIC_USER" "$BASIC_PASS" >/dev/null
@@ -933,21 +1004,25 @@ gw_action_install_update() {
 
   gw_write_map_conf
   gw_write_locations_snippet "$ENABLE_BASICAUTH" "$ENABLE_IPWL" "$IPWL"
-  gw_write_site_conf "$DOMAIN" "$HTTP_PORT"
 
+  # 先写 HTTP-only 配置以通过 nginx 校验并支撑 webroot 验证
+  gw_write_site_conf "$DOMAIN" "$HTTP_PORT" "n"
   apply_with_rollback "$backup" "$dump" || return 1
 
   if [[ "$ENABLE_SSL" == "y" ]]; then
     set +e
-    certbot_enable_tls "$DOMAIN" "$EMAIL"
+    certbot_issue_webroot "$DOMAIN" "$EMAIL"
     local rc=$?
     set -e
     if [[ $rc -ne 0 ]]; then
-      echo "❌ certbot 配置失败，回滚..."
+      echo "❌ 证书申请失败，回滚..."
       restore_nginx "$backup"
       reload_nginx
       return 1
     fi
+
+    # 写入带 TLS 的配置并再次校验
+    gw_write_site_conf "$DOMAIN" "$HTTP_PORT" "y"
     apply_with_rollback "$backup" "$dump" || return 1
   fi
 
@@ -1014,7 +1089,7 @@ gw_action_uninstall() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap '[[ -n "${dump:-}" ]] && rm -f "$dump"; trap - RETURN' RETURN
+  trap 'rm -f "$dump"' RETURN
 
   rm -f "$enabled" "$conf" "$GW_MAP_CONF" "$GW_SNIP_CONF" "$GW_HTPASSWD" 2>/dev/null || true
   apply_with_rollback "$backup" "$dump" || true
