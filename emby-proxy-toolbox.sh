@@ -653,29 +653,24 @@ gw_write_locations_snippet() {
 
   local auth_snip="" allow_snip=""
   if [[ "$enable_basicauth" == "y" ]]; then
-    auth_snip=$'    auth_basic "Restricted";
-    auth_basic_user_file /etc/nginx/.htpasswd-emby-gw;
-'
+    auth_snip=$'    auth_basic "Restricted";\n    auth_basic_user_file /etc/nginx/.htpasswd-emby-gw;\n'
   fi
   if [[ "$enable_ip_whitelist" == "y" ]]; then
     local csv="${whitelist_csv// /}"
     IFS=',' read -r -a arr <<<"$csv"
-    for cidr in "${arr[@]}"; do [[ -z "$cidr" ]] && continue; allow_snip+="    allow ${cidr};
-"; done
-    allow_snip+="    deny all;
-"
+    for cidr in "${arr[@]}"; do
+      [[ -z "$cidr" ]] && continue
+      allow_snip+="    allow ${cidr};\n"
+    done
+    allow_snip+="    deny all;\n"
   fi
 
+  # 先写入带占位符的 snippet（避免在 heredoc 里转义一堆 $nginx_var）
   cat > "$GW_SNIP_CONF" <<'EOF'
 # Managed by emby-proxy-toolbox (universal gateway)
 # Included inside server{} (这里不能出现 map 指令)
 
 # --- websocket ---
-map $http_upgrade $connection_upgrade {
-  default upgrade;
-  ""      close;
-}
-
 proxy_http_version 1.1;
 proxy_set_header Upgrade $http_upgrade;
 proxy_set_header Connection $connection_upgrade;
@@ -709,26 +704,18 @@ location ~ ^/http/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
 __AUTH_SNIP__
 __ALLOW_SNIP__
 
-    # Host for upstream (avoid 421 on CF-backed origins)
     proxy_set_header Host $up_host_only;
     proxy_set_header X-Forwarded-Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
 
-    proxy_ssl_server_name on;
-
-    # 关键：把上游 redirect 改写回网关，避免客户端跟跳转直连源站
+    # --- redirect rewrite (prevent bypass) ---
     proxy_redirect off;
-    # 若已是网关自身的绝对跳转，保持（避免 double-prefix）
-    proxy_redirect ~^https?://$host(/.*)$ $1;
-    # 若已是 /http|/https 前缀，保持
-    proxy_redirect ~^/(http|https)/.*$ $0;
-    # 绝对跳转（http/https）统一改为网关前缀
+    proxy_redirect ~^https?://[^/]+(/http/.*)$ $1;
+    proxy_redirect ~^https?://[^/]+(/https/.*)$ $1;
     proxy_redirect ~^https?://[^/]+(/.*)$ $gw_prefix$1;
-    # 以 / 开头的相对跳转
     proxy_redirect ~^/(.*)$ $gw_prefix/$1;
-    # 不以 / 开头的相对跳转（例如 web/index.html）
     proxy_redirect ~^([^/].*)$ $gw_prefix/$1;
 
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
@@ -751,9 +738,10 @@ __ALLOW_SNIP__
 
     proxy_ssl_server_name on;
 
+    # --- redirect rewrite (prevent bypass) ---
     proxy_redirect off;
-    proxy_redirect ~^https?://$host(/.*)$ $1;
-    proxy_redirect ~^/(http|https)/.*$ $0;
+    proxy_redirect ~^https?://[^/]+(/http/.*)$ $1;
+    proxy_redirect ~^https?://[^/]+(/https/.*)$ $1;
     proxy_redirect ~^https?://[^/]+(/.*)$ $gw_prefix$1;
     proxy_redirect ~^/(.*)$ $gw_prefix/$1;
     proxy_redirect ~^([^/].*)$ $gw_prefix/$1;
@@ -761,7 +749,7 @@ __ALLOW_SNIP__
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
 
-# ---------------- default: /<target>/... (defaults to https) ----------------
+# -------- default: /<target>/... (scheme defaults to https) --------
 location ~ ^/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
     set $up_scheme https;
     if ($up_rest = "") { set $up_rest "/"; }
@@ -778,9 +766,10 @@ __ALLOW_SNIP__
 
     proxy_ssl_server_name on;
 
+    # --- redirect rewrite (prevent bypass) ---
     proxy_redirect off;
-    proxy_redirect ~^https?://$host(/.*)$ $1;
-    proxy_redirect ~^/(http|https)/.*$ $0;
+    proxy_redirect ~^https?://[^/]+(/http/.*)$ $1;
+    proxy_redirect ~^https?://[^/]+(/https/.*)$ $1;
     proxy_redirect ~^https?://[^/]+(/.*)$ $gw_prefix$1;
     proxy_redirect ~^/(.*)$ $gw_prefix/$1;
     proxy_redirect ~^([^/].*)$ $gw_prefix/$1;
@@ -789,23 +778,20 @@ __ALLOW_SNIP__
 }
 EOF
 
-  # 替换占位符
-  local tmp="${GW_SNIP_CONF}.tmp"
-  if [[ -n "$auth_snip" ]]; then
-    awk -v repl="$auth_snip" '{gsub(/__AUTH_SNIP__/, repl); print}' "$GW_SNIP_CONF" > "$tmp"
-  else
-    awk '{gsub(/__AUTH_SNIP__
-?/, ""); print}' "$GW_SNIP_CONF" > "$tmp"
-  fi
-  mv "$tmp" "$GW_SNIP_CONF"
+  # 用 sed 把占位符行替换为多行 snippet（支持空串）
+  local tmp_auth tmp_allow tmp_out
+  tmp_auth="$(mktemp)"
+  tmp_allow="$(mktemp)"
+  tmp_out="$(mktemp)"
+  printf '%b' "$auth_snip" > "$tmp_auth"
+  printf '%b' "$allow_snip" > "$tmp_allow"
 
-  if [[ -n "$allow_snip" ]]; then
-    awk -v repl="$allow_snip" '{gsub(/__ALLOW_SNIP__/, repl); print}' "$GW_SNIP_CONF" > "$tmp"
-  else
-    awk '{gsub(/__ALLOW_SNIP__
-?/, ""); print}' "$GW_SNIP_CONF" > "$tmp"
-  fi
-  mv "$tmp" "$GW_SNIP_CONF"
+  sed -e "/^__AUTH_SNIP__$/ { r ${tmp_auth}; d; }" \
+      -e "/^__ALLOW_SNIP__$/ { r ${tmp_allow}; d; }" \
+      "$GW_SNIP_CONF" > "$tmp_out"
+
+  mv "$tmp_out" "$GW_SNIP_CONF"
+  rm -f "$tmp_auth" "$tmp_allow"
 }
 
 gw_write_site_conf() {
