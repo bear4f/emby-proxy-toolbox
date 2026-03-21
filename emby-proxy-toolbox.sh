@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # emby-proxy-toolbox.sh
 # 一体化 Emby 反代工具箱（单站反代管理器 + 通用反代网关）
-set -euo pipefail
+set -Eeuo pipefail
+# 让 ERR trap 在函数/子shell中生效
+set -o errtrace
 
 _on_err() {
   local line="${1:-?}"
@@ -12,8 +14,7 @@ _on_err() {
     nginx -t 2>&1 | tail -n 5 >&2 || true
   fi
 }
-trap '_on_err "$LINENO" "$BASH_COMMAND"' ERR
-
+trap '_on_err \"$LINENO\" \"$BASH_COMMAND\"' ERR
 # 备份保留份数（默认 2）
 KEEP_BACKUPS="${KEEP_BACKUPS:-2}"
 
