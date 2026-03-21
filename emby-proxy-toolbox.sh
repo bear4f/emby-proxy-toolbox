@@ -3,6 +3,17 @@
 # 一体化 Emby 反代工具箱（单站反代管理器 + 通用反代网关）
 set -euo pipefail
 
+_on_err() {
+  local line="${1:-?}"
+  local cmd="${2:-?}"
+  echo "❌ 脚本出错：第 ${line} 行：${cmd}" >&2
+  # 如果 nginx 语法失败，顺便打印一行提示（避免完全静默）
+  if command -v nginx >/dev/null 2>&1; then
+    nginx -t 2>&1 | tail -n 5 >&2 || true
+  fi
+}
+trap '_on_err "$LINENO" "$BASH_COMMAND"' ERR
+
 # 备份保留份数（默认 2）
 KEEP_BACKUPS="${KEEP_BACKUPS:-2}"
 
@@ -219,7 +230,7 @@ certbot_issue_webroot() {
   ensure_certbot
   mkdir -p /var/www/html
   certbot certonly --webroot -w /var/www/html -d "$domain" \
-    --agree-tos -m "$email" --non-interactive --keep-until-expiring >/dev/null
+    --agree-tos -m "$email" --non-interactive --keep-until-expiring
 }
 
 disable_conflicting_server_name() {
@@ -626,35 +637,47 @@ single_menu() {
 # ========================= 通用网关 =========================
 gw_conf_path_for_domain() { local d="$1"; echo "${SITES_AVAIL}/${GW_PREFIX}$(sanitize_name "$d").conf"; }
 gw_enabled_path_for_domain(){ local d="$1"; echo "${SITES_ENAB}/${GW_PREFIX}$(sanitize_name "$d").conf"; }
-
 gw_write_map_conf() {
   mkdir -p /etc/nginx/conf.d
-  cat > "$GW_MAP_CONF" <<'EOF'
-# Managed by emby-proxy-toolbox (universal gateway)
-# Loaded under http{} via /etc/nginx/conf.d/*.conf
+  cat > "$GW_MAP_CONF" <<'EOL'
+# Managed by emby-proxy-toolbox (gateway maps)
 
+# 连接升级（WebSocket）
 map $http_upgrade $connection_upgrade {
   default upgrade;
   ""      close;
 }
 
-map $up_target $up_host_only {
-  default                                $up_target;
-  ~^\[(?<h>[A-Fa-f0-9:.]+)\](:\d+)?$     [$h];
-  ~^(?<h>[^:]+)(:\d+)?$                  $h;
-}
-EOF
+# 外部协议（用于生成绝对 Location；优先使用 X-Forwarded-Proto）
+map $http_x_forwarded_proto $gw_proto {
+  default $scheme;
+  "~*https" https;
+  "~*http"  http;
 }
 
+# Extract upstream host (no port) for Host header to avoid 421 on CF-backed origins.
+map $up_target $up_host_only {
+  default                              $up_target;
+  ~^\[(?<h>[A-Fa-f0-9:.]+)\](:\d+)?$   [$h];
+  ~^(?<h>[^:]+)(:\d+)?$                $h;
+}
+EOL
+}
 gw_write_locations_snippet() {
-  local enable_basicauth="$1" enable_ip_whitelist="$2" whitelist_csv="$3"
+  local enable_basicauth="$1"
+  local enable_ip_whitelist="$2"
+  local whitelist_csv="$3"
 
   mkdir -p /etc/nginx/snippets
 
-  local auth_snip="" allow_snip=""
+  # Build auth snippet
+  local auth_snip=""
   if [[ "$enable_basicauth" == "y" ]]; then
-    auth_snip=$'    auth_basic "Restricted";\n    auth_basic_user_file /etc/nginx/.htpasswd-emby-gw;\n'
+    auth_snip=$'    auth_basic "Restricted";\n    auth_basic_user_file '"$GW_HTPASSWD"$';\n'
   fi
+
+  # Build allowlist snippet
+  local allow_snip=""
   if [[ "$enable_ip_whitelist" == "y" ]]; then
     local csv="${whitelist_csv// /}"
     IFS=',' read -r -a arr <<<"$csv"
@@ -665,133 +688,123 @@ gw_write_locations_snippet() {
     allow_snip+="    deny all;\n"
   fi
 
-  # 先写入带占位符的 snippet（避免在 heredoc 里转义一堆 $nginx_var）
-  cat > "$GW_SNIP_CONF" <<'EOF'
+  cat > "$GW_SNIP_CONF" <<'EOL'
 # Managed by emby-proxy-toolbox (universal gateway)
-# Included inside server{} (这里不能出现 map 指令)
+# Common proxy settings for Emby (websocket + range + long timeouts)
+# NOTE: Do NOT put 'map' directives in snippets; maps are defined in /etc/nginx/conf.d/emby-gw-map.conf.
 
-# --- websocket ---
 proxy_http_version 1.1;
 proxy_set_header Upgrade $http_upgrade;
 proxy_set_header Connection $connection_upgrade;
 
-# --- range streaming ---
 proxy_set_header Range $http_range;
 proxy_set_header If-Range $http_if_range;
 
-# --- timeouts ---
 proxy_buffering off;
 proxy_request_buffering off;
 proxy_read_timeout 3600s;
 proxy_send_timeout 3600s;
 client_max_body_size 500m;
 
-# Nginx variable upstream needs resolver
+# For variable upstream, Nginx needs a resolver.
 resolver 1.1.1.1 8.8.8.8 valid=60s;
 resolver_timeout 5s;
 
-# 规范化：避免 Location: web/index.html 这类相对跳转把 target 丢了
-location ~ ^/http/(?<t>[A-Za-z0-9.\-_\[\]:]+)$  { return 301 /http/$t/; }
-location ~ ^/https/(?<t>[A-Za-z0-9.\-_\[\]:]+)$ { return 301 /https/$t/; }
-location ~ ^/(?<t>[A-Za-z0-9.\-_\[\]:]+)$      { return 301 /$t/; }
+# ---- normalize: ensure trailing slash so relative Location like "web/index.html" won't drop the target ----
+location ~ ^/http/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)$  { return 301 $gw_proto://$host/http/$up_target/; }
+location ~ ^/https/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)$ { return 301 $gw_proto://$host/https/$up_target/; }
+location ~ ^/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)$       { return 301 $gw_proto://$host/$up_target/; }
 
-# ---------------- /http/<target>/... ----------------
+# /http/<target>/...
 location ~ ^/http/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
     set $up_scheme http;
     if ($up_rest = "") { set $up_rest "/"; }
-    set $gw_prefix /http/$up_target;
 
-__AUTH_SNIP__
-__ALLOW_SNIP__
+    # AUTH_SNIP
+    # ALLOW_SNIP
 
+    # 防 421：回源 Host 用上游主机名（无端口）
     proxy_set_header Host $up_host_only;
     proxy_set_header X-Forwarded-Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Proto $gw_proto;
 
-    # --- redirect rewrite (prevent bypass) ---
+    # 关键：变量 proxy_pass 时，默认不会自动改写 Location；这里强制改写为“绝对 URL”，防止客户端直连上游
     proxy_redirect off;
-    proxy_redirect ~^https?://[^/]+(/http/.*)$ $1;
-    proxy_redirect ~^https?://[^/]+(/https/.*)$ $1;
-    proxy_redirect ~^https?://[^/]+(/.*)$ $gw_prefix$1;
-    proxy_redirect ~^/(.*)$ $gw_prefix/$1;
-    proxy_redirect ~^([^/].*)$ $gw_prefix/$1;
+
+    # 0) 若上游已经返回指向本网关的绝对 Location，保持不变（防止 double-prefix）
+    proxy_redirect ~^https?://$host(/.*)$ $gw_proto://$host$1;
+
+    # 1) 绝对跳转：回到网关
+    proxy_redirect ~^http://([^/]+)(/.*)$  $gw_proto://$host/http/$1$2;
+    proxy_redirect ~^https://([^/]+)(/.*)$ $gw_proto://$host/https/$1$2;
+
+    # 2) 根路径相对跳转：补全为网关前缀（排除已是 /http 或 /https）
+    proxy_redirect ~^/(?!http/|https/)(.*)$ $gw_proto://$host/http/$up_target/$1;
+
+    # 3) 非 / 开头相对跳转（例如 "web/index.html"）
+    proxy_redirect ~^([^/].*)$ $gw_proto://$host/http/$up_target/$1;
 
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
 
-# ---------------- /https/<target>/... ----------------
+# /https/<target>/...
 location ~ ^/https/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
     set $up_scheme https;
     if ($up_rest = "") { set $up_rest "/"; }
-    set $gw_prefix /https/$up_target;
 
-__AUTH_SNIP__
-__ALLOW_SNIP__
+    # AUTH_SNIP
+    # ALLOW_SNIP
 
     proxy_set_header Host $up_host_only;
     proxy_set_header X-Forwarded-Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Proto $gw_proto;
 
     proxy_ssl_server_name on;
 
-    # --- redirect rewrite (prevent bypass) ---
     proxy_redirect off;
-    proxy_redirect ~^https?://[^/]+(/http/.*)$ $1;
-    proxy_redirect ~^https?://[^/]+(/https/.*)$ $1;
-    proxy_redirect ~^https?://[^/]+(/.*)$ $gw_prefix$1;
-    proxy_redirect ~^/(.*)$ $gw_prefix/$1;
-    proxy_redirect ~^([^/].*)$ $gw_prefix/$1;
+    proxy_redirect ~^https?://$host(/.*)$ $gw_proto://$host$1;
+    proxy_redirect ~^http://([^/]+)(/.*)$  $gw_proto://$host/http/$1$2;
+    proxy_redirect ~^https://([^/]+)(/.*)$ $gw_proto://$host/https/$1$2;
+    proxy_redirect ~^/(?!http/|https/)(.*)$ $gw_proto://$host/https/$up_target/$1;
+    proxy_redirect ~^([^/].*)$ $gw_proto://$host/https/$up_target/$1;
 
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
 
-# -------- default: /<target>/... (scheme defaults to https) --------
+# Default: /<target>/...  (scheme defaults to https)
 location ~ ^/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
     set $up_scheme https;
     if ($up_rest = "") { set $up_rest "/"; }
-    set $gw_prefix /$up_target;
 
-__AUTH_SNIP__
-__ALLOW_SNIP__
+    # AUTH_SNIP
+    # ALLOW_SNIP
 
     proxy_set_header Host $up_host_only;
     proxy_set_header X-Forwarded-Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Proto $gw_proto;
 
     proxy_ssl_server_name on;
 
-    # --- redirect rewrite (prevent bypass) ---
     proxy_redirect off;
-    proxy_redirect ~^https?://[^/]+(/http/.*)$ $1;
-    proxy_redirect ~^https?://[^/]+(/https/.*)$ $1;
-    proxy_redirect ~^https?://[^/]+(/.*)$ $gw_prefix$1;
-    proxy_redirect ~^/(.*)$ $gw_prefix/$1;
-    proxy_redirect ~^([^/].*)$ $gw_prefix/$1;
+    proxy_redirect ~^https?://$host(/.*)$ $gw_proto://$host$1;
+    proxy_redirect ~^http://([^/]+)(/.*)$  $gw_proto://$host/http/$1$2;
+    proxy_redirect ~^https://([^/]+)(/.*)$ $gw_proto://$host/https/$1$2;
+    proxy_redirect ~^/(?!http/|https/)(.*)$ $gw_proto://$host/$up_target/$1;
+    proxy_redirect ~^([^/].*)$ $gw_proto://$host/$up_target/$1;
 
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
-EOF
+EOL
 
-  # 用 sed 把占位符行替换为多行 snippet（支持空串）
-  local tmp_auth tmp_allow tmp_out
-  tmp_auth="$(mktemp)"
-  tmp_allow="$(mktemp)"
-  tmp_out="$(mktemp)"
-  printf '%b' "$auth_snip" > "$tmp_auth"
-  printf '%b' "$allow_snip" > "$tmp_allow"
-
-  sed -e "/^__AUTH_SNIP__$/ { r ${tmp_auth}; d; }" \
-      -e "/^__ALLOW_SNIP__$/ { r ${tmp_allow}; d; }" \
-      "$GW_SNIP_CONF" > "$tmp_out"
-
-  mv "$tmp_out" "$GW_SNIP_CONF"
-  rm -f "$tmp_auth" "$tmp_allow"
+  # Inject auth/allow snippets safely
+  # Replace placeholders with multi-line content using perl (safe)
+  perl -0777 -i -pe "s/# AUTH_SNIP/$auth_snip/g; s/# ALLOW_SNIP/$allow_snip/g" "$GW_SNIP_CONF"
 }
 
 gw_write_site_conf() {
