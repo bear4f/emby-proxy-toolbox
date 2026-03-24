@@ -28,23 +28,23 @@ has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 prompt() {
   local __var="$1" __msg="$2" __def="${3:-}"
-  local input=""
+  local __ans=""
   if [[ -n "$__def" ]]; then
-    read -r -p "$__msg [$__def]: " input
-    input="${input:-$__def}"
+    read -r -p "$__msg [$__def]: " __ans
+    __ans="${__ans:-$__def}"
   else
-    read -r -p "$__msg: " input
+    read -r -p "$__msg: " __ans
   fi
-  printf -v "$__var" "%s" "$input"
+  printf -v "$__var" "%s" "$__ans"
 }
 
 yesno() {
   local __var="$1" __msg="$2" __def="${3:-y}"
-  local input=""
-  read -r -p "$__msg (y/n) [$__def]: " input
-  input="${input:-$__def}"
-  input="$(echo "$input" | tr '[:upper:]' '[:lower:]')"
-  [[ "$input" == "y" || "$input" == "yes" ]] && printf -v "$__var" "y" || printf -v "$__var" "n"
+  local __ans=""
+  read -r -p "$__msg (y/n) [$__def]: " __ans
+  __ans="${__ans:-$__def}"
+  __ans="$(echo "$__ans" | tr '[:upper:]' '[:lower:]')"
+  [[ "$__ans" == "y" || "$__ans" == "yes" ]] && printf -v "$__var" "y" || printf -v "$__var" "n"
 }
 
 strip_scheme() { local s="$1"; s="${s#http://}"; s="${s#https://}"; echo "$s"; }
@@ -981,12 +981,12 @@ gw_rewrite_add_rule() {
   echo "  https://api.example.com:443/base"
   echo "也可以只填 host 或 host:port 或 host/path（未写协议默认按 http 处理）"
   echo
-  local input
-  prompt input "后端地址（URL/host:port/path）"
-  [[ -n "$input" ]] || { echo "输入为空，已取消。"; return 1; }
+  local backend_in=""
+  prompt backend_in "后端地址（URL/host:port/path）"
+  [[ -n "$backend_in" ]] || { echo "输入为空，已取消。"; return 1; }
 
   local parsed scheme host port prefix
-  parsed="$(gw_parse_backend_input "$input")"
+  parsed="$(gw_parse_backend_input "$backend_in")"
   IFS='|' read -r scheme host port prefix <<<"$parsed"
 
   echo
