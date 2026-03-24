@@ -17,8 +17,6 @@ GW_PREFIX="emby-gw-"
 GW_MAP_CONF="/etc/nginx/conf.d/emby-gw-map.conf"
 GW_SNIP_CONF="/etc/nginx/snippets/emby-gw-locations.conf"
 GW_HTPASSWD="/etc/nginx/.htpasswd-emby-gw"
-GW_REWRITE_RULES="/etc/nginx/emby-gw-rewrite.rules"
-GW_REWRITE_SNIP="/etc/nginx/snippets/emby-gw-rewrite.conf"
 
 TOOL_NAME="emby-proxy-toolbox"
 # ------------------------------------------------
@@ -28,23 +26,23 @@ has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 prompt() {
   local __var="$1" __msg="$2" __def="${3:-}"
-  local __ans=""
+  local input=""
   if [[ -n "$__def" ]]; then
-    read -r -p "$__msg [$__def]: " __ans
-    __ans="${__ans:-$__def}"
+    read -r -p "$__msg [$__def]: " input
+    input="${input:-$__def}"
   else
-    read -r -p "$__msg: " __ans
+    read -r -p "$__msg: " input
   fi
-  printf -v "$__var" "%s" "$__ans"
+  printf -v "$__var" "%s" "$input"
 }
 
 yesno() {
   local __var="$1" __msg="$2" __def="${3:-y}"
-  local __ans=""
-  read -r -p "$__msg (y/n) [$__def]: " __ans
-  __ans="${__ans:-$__def}"
-  __ans="$(echo "$__ans" | tr '[:upper:]' '[:lower:]')"
-  [[ "$__ans" == "y" || "$__ans" == "yes" ]] && printf -v "$__var" "y" || printf -v "$__var" "n"
+  local input=""
+  read -r -p "$__msg (y/n) [$__def]: " input
+  input="${input:-$__def}"
+  input="$(echo "$input" | tr '[:upper:]' '[:lower:]')"
+  [[ "$input" == "y" || "$input" == "yes" ]] && printf -v "$__var" "y" || printf -v "$__var" "n"
 }
 
 strip_scheme() { local s="$1"; s="${s#http://}"; s="${s#https://}"; echo "$s"; }
@@ -459,7 +457,7 @@ single_action_add_or_edit() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap '[ -n "${dump:-}" ] && rm -f "${dump:-}"' RETURN
+  trap 'rm -f "$dump"' RETURN
 
   set +e
   single_write_site_conf "$DOMAIN" "$ORIGIN_HOST" "$ORIGIN_PORT" "$ORIGIN_SCHEME" \
@@ -552,7 +550,7 @@ single_action_delete() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap '[ -n "${dump:-}" ] && rm -f "${dump:-}"' RETURN
+  trap 'rm -f "$dump"' RETURN
 
   rm -f "$enabled" "$conf"
   apply_with_rollback "$backup" "$dump" || return 1
@@ -693,9 +691,6 @@ location ~ ^/http/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
 
     proxy_ssl_server_name on;
 
-    # 前后端分离：后端 URL 重写（如未配置规则，该文件为空，不影响）
-    include /etc/nginx/snippets/emby-gw-rewrite.conf;
-
     # Rewrite redirects back to gateway to prevent client bypass.
     # Many clients require ABSOLUTE Location; we emit https://$host/...
     proxy_redirect off;
@@ -723,9 +718,6 @@ location ~ ^/https/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
 
     proxy_ssl_server_name on;
 
-    # 前后端分离：后端 URL 重写（如未配置规则，该文件为空，不影响）
-    include /etc/nginx/snippets/emby-gw-rewrite.conf;
-
     proxy_redirect off;
     proxy_redirect ~^http://([^/]+)(/.*)$  https://$host/http/$1$2;
     proxy_redirect ~^https://([^/]+)(/.*)$ https://$host/https/$1$2;
@@ -750,9 +742,6 @@ location ~ ^/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
     proxy_set_header X-Forwarded-Proto $scheme;
 
     proxy_ssl_server_name on;
-
-    # 前后端分离：后端 URL 重写（如未配置规则，该文件为空，不影响）
-    include /etc/nginx/snippets/emby-gw-rewrite.conf;
 
     proxy_redirect off;
     proxy_redirect ~^http://([^/]+)(/.*)$  https://$host/http/$1$2;
@@ -837,256 +826,6 @@ gw_print_usage() {
   echo
 }
 
-# -------------------- 通用网关：前后端分离（后端 URL 重写） --------------------
-gw_parse_backend_input() {
-  # input: URL 或 host[:port][/path]
-  # output: scheme|host|port|path_prefix
-  local raw="$1"
-  raw="$(echo "$raw" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-  [[ -n "$raw" ]] || { echo "|||" ; return 0; }
-
-  local scheme="http"
-  if [[ "$raw" =~ ^https?:// ]]; then
-    scheme="${raw%%://*}"
-    raw="${raw#*://}"
-  fi
-
-  # strip query/fragment
-  raw="${raw%%\#*}"
-  raw="${raw%%\?*}"
-
-  local hostport path="/"
-  if [[ "$raw" == */* ]]; then
-    hostport="${raw%%/*}"
-    path="/${raw#*/}"
-  else
-    hostport="$raw"
-    path="/"
-  fi
-
-  local host="$hostport" port=""
-  # IPv6 in brackets: [::1]:8080
-  if [[ "$hostport" =~ ^\[(.+)\]:(\d+)$ ]]; then
-    host="[${BASH_REMATCH[1]}]"
-    port="${BASH_REMATCH[2]}"
-  elif [[ "$hostport" =~ ^\[(.+)\]$ ]]; then
-    host="[${BASH_REMATCH[1]}]"
-    port=""
-  elif [[ "$hostport" =~ ^(.+):(\d+)$ ]]; then
-    host="${BASH_REMATCH[1]}"
-    port="${BASH_REMATCH[2]}"
-  fi
-
-  if [[ -z "$port" ]]; then
-    if [[ "$scheme" == "https" ]]; then port="443"; else port="80"; fi
-  fi
-
-  # path_prefix: 只取第一段，减少误伤（/stream/xxx -> /stream）
-  local prefix=""
-  if [[ "$path" != "/" && -n "$path" ]]; then
-    local seg="${path#/}"
-    seg="${seg%%/*}"
-    [[ -n "$seg" ]] && prefix="/$seg"
-  fi
-
-  echo "${scheme}|${host}|${port}|${prefix}"
-}
-
-gw_rewrite_ensure_files() {
-  mkdir -p /etc/nginx/snippets
-  [[ -f "$GW_REWRITE_RULES" ]] || : >"$GW_REWRITE_RULES"
-  [[ -f "$GW_REWRITE_SNIP" ]]  || : >"$GW_REWRITE_SNIP"
-}
-
-gw_rewrite_render_snippet() {
-  local gw_domain="$1"   # gateway entry domain, used as literal in sub_filter replacement
-  gw_rewrite_ensure_files
-
-  : >"$GW_REWRITE_SNIP"
-  cat >>"$GW_REWRITE_SNIP" <<EOF
-# Managed by ${TOOL_NAME} (gateway backend URL rewrite)
-# 注意：sub_filter 只能改写“响应内容/可见 Location”，无法拦截客户端完全独立直连的第二域名。
-# gateway: ${gw_domain}
-
-EOF
-
-  if [[ ! -s "$GW_REWRITE_RULES" ]]; then
-    echo "# (no rewrite rules)" >>"$GW_REWRITE_SNIP"
-    return 0
-  fi
-
-  cat >>"$GW_REWRITE_SNIP" <<'EOF'
-# Enable sub_filter (force upstream uncompressed)
-proxy_set_header Accept-Encoding "";
-sub_filter_once off;
-sub_filter_types text/html text/plain application/json application/javascript text/css;
-EOF
-
-  while IFS='|' read -r scheme host port prefix; do
-    [[ -z "$scheme" || -z "$host" || -z "$port" ]] && continue
-    [[ "$scheme" != "http" && "$scheme" != "https" ]] && continue
-    prefix="${prefix:-}"
-    [[ -n "$prefix" && "$prefix" != /* ]] && prefix="/$prefix"
-
-    local target="${host}:${port}"
-    local gw_base="https://${gw_domain}"
-    local rep_base="${gw_base}/${scheme}/${target}${prefix}"
-
-    # Build search candidates (with/without explicit port for default ports)
-    local default_port="80"
-    [[ "$scheme" == "https" ]] && default_port="443"
-
-    local with_port="${scheme}://${host}:${port}${prefix}"
-    local no_port="${scheme}://${host}${prefix}"
-    local with_port_sr="//${host}:${port}${prefix}"
-    local no_port_sr="//${host}${prefix}"
-
-    if [[ "$port" == "$default_port" ]]; then
-      printf 'sub_filter "%s" "%s";\n' "$no_port"     "$rep_base" >>"$GW_REWRITE_SNIP"
-      printf 'sub_filter "%s" "%s";\n' "$with_port"   "$rep_base" >>"$GW_REWRITE_SNIP"
-      printf 'sub_filter "%s" "%s";\n' "$no_port_sr"  "$rep_base" >>"$GW_REWRITE_SNIP"
-      printf 'sub_filter "%s" "%s";\n' "$with_port_sr" "$rep_base" >>"$GW_REWRITE_SNIP"
-    else
-      printf 'sub_filter "%s" "%s";\n' "$with_port"   "$rep_base" >>"$GW_REWRITE_SNIP"
-      printf 'sub_filter "%s" "%s";\n' "$with_port_sr" "$rep_base" >>"$GW_REWRITE_SNIP"
-    fi
-  done <"$GW_REWRITE_RULES"
-}
-
-gw_rewrite_apply_reload() {
-  local gw_domain="$1"
-  ensure_deps
-  ensure_sites_enabled_include
-  nginx_self_heal_compat
-
-  local backup dump
-  backup="$(backup_nginx)"
-  dump="$(mktemp)"
-  trap '[ -n "${dump:-}" ] && rm -f "${dump:-}"' RETURN
-
-  gw_rewrite_render_snippet "$gw_domain"
-  apply_with_rollback "$backup" "$dump" || return 1
-  return 0
-}
-
-gw_rewrite_add_rule() {
-  local gw_domain="$1"
-  gw_rewrite_ensure_files
-
-  echo
-  echo "请直接粘贴你抓包看到的“后端地址”（脚本自动分析）："
-  echo "示例（占位示例域名）："
-  echo "  http://media-backend.example.net/stream"
-  echo "  http://origin-node.example.org:2052"
-  echo "  https://api.example.com:443/base"
-  echo "也可以只填 host 或 host:port 或 host/path（未写协议默认按 http 处理）"
-  echo
-  local backend_in=""
-  prompt backend_in "后端地址（URL/host:port/path）"
-  [[ -n "$backend_in" ]] || { echo "输入为空，已取消。"; return 1; }
-
-  local parsed scheme host port prefix
-  parsed="$(gw_parse_backend_input "$backend_in")"
-  IFS='|' read -r scheme host port prefix <<<"$parsed"
-
-  echo
-  echo "---- 解析结果 ----"
-  echo "协议:     ${scheme}"
-  echo "主机:     ${host}"
-  echo "端口:     ${port}"
-  echo "路径前缀: ${prefix:-/（未指定）}"
-  echo "------------------"
-  echo
-
-  local ok
-  yesno ok "确认添加该后端重写规则" "y"
-  [[ "$ok" == "y" ]] || { echo "已取消。"; return 0; }
-
-  local line="${scheme}|${host}|${port}|${prefix}"
-  # avoid duplicates
-  grep -Fxq "$line" "$GW_REWRITE_RULES" 2>/dev/null || echo "$line" >>"$GW_REWRITE_RULES"
-
-  gw_rewrite_apply_reload "$gw_domain" || return 1
-  echo "✅ 已添加并生效：$line"
-  echo "提示：该功能仅在后端 URL 出现在 HTML/JS/JSON 或可见 Location 中时有效。"
-}
-
-gw_rewrite_list_rules() {
-  gw_rewrite_ensure_files
-  echo "=== 当前后端重写规则（scheme|host|port|path_prefix）==="
-  if [[ ! -s "$GW_REWRITE_RULES" ]]; then
-    echo "（空）"
-    return 0
-  fi
-  nl -ba "$GW_REWRITE_RULES"
-}
-
-gw_rewrite_delete_rule() {
-  local gw_domain="$1"
-  gw_rewrite_list_rules
-  [[ -s "$GW_REWRITE_RULES" ]] || return 0
-
-  local n
-  prompt n "请输入要删除的规则行号"
-  [[ "$n" =~ ^[0-9]+$ ]] || { echo "行号不合法"; return 1; }
-  sed -i "${n}d" "$GW_REWRITE_RULES" || true
-  gw_rewrite_apply_reload "$gw_domain" || return 1
-  echo "✅ 已删除并生效。"
-}
-
-gw_rewrite_clear_rules() {
-  local gw_domain="$1"
-  local ok
-  yesno ok "确认清空全部重写规则" "n"
-  [[ "$ok" == "y" ]] || { echo "已取消。"; return 0; }
-  : >"$GW_REWRITE_RULES"
-  gw_rewrite_apply_reload "$gw_domain" || return 1
-  echo "✅ 已清空并生效。"
-}
-
-gw_rewrite_menu() {
-  local gw_domain=""
-  prompt gw_domain "请输入当前网关入口域名（只填域名，不要 https://；用于生成重写 URL）"
-  gw_domain="$(strip_scheme "$gw_domain")"
-  [[ -n "$gw_domain" ]] || { echo "域名不能为空"; return 1; }
-
-  while true; do
-    echo
-    echo "========== 前后端分离配置（通用网关） =========="
-    echo "用途：当 Emby 前端域名 A 可用，但播放/接口跳到后端域名 B 时，尝试把响应中的 B 改写回网关。"
-    echo "注意：仅对 HTML/JS/JSON/Location 可见时有效；若客户端直接硬连 B，此法无效（需 DNS 接管）。"
-    echo
-    echo "1) 添加后端重写规则（粘贴抓包后端地址 URL）"
-    echo "2) 查看现有规则"
-    echo "3) 删除一条规则"
-    echo "4) 清空全部规则"
-    echo "0) 返回"
-    echo "=============================================="
-    read -r -p "请选择: " c
-    case "$c" in
-      1) gw_rewrite_add_rule "$gw_domain" ;;
-      2) gw_rewrite_list_rules ;;
-      3) gw_rewrite_delete_rule "$gw_domain" ;;
-      4) gw_rewrite_clear_rules "$gw_domain" ;;
-      0) return 0 ;;
-      *) echo "无效选项" ;;
-    esac
-  done
-}
-
-frontsplit_guide() {
-  echo
-  echo "=== 前后端分离向导（通用网关）==="
-  echo "当某些 Emby 服存在：前端域名 A / 后端（推流）域名 B 的情况时，客户端可能会绕过网关直连 B。"
-  echo "本向导提供“后端 URL 重写”能力：把响应中出现的 B 改写成走网关的 /http/ 或 /https/ 路径。"
-  echo
-  echo "操作建议："
-  echo "  1) 先确保通用网关已部署且可访问（主菜单 2 -> 网关安装/更新）。"
-  echo "  2) 用抓包/开发者工具找到后端地址（如 http://media-backend.example.net/stream）。"
-  echo "  3) 进入本向导添加规则，保存后重新在客户端刷新/重新添加服务器。"
-  echo
-  gw_rewrite_menu
-}
 gw_action_install_update() {
   local DOMAIN ENABLE_SSL EMAIL ENABLE_BASICAUTH BASIC_USER BASIC_PASS ENABLE_IPWL IPWL ok
   prompt DOMAIN "你的网关入口域名（例如 autoemby.example.com；只填域名，不要 https://）"
@@ -1139,12 +878,10 @@ gw_action_install_update() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap '[ -n "${dump:-}" ] && rm -f "${dump:-}"' RETURN
+  trap 'rm -f "$dump"' RETURN
 
   gw_write_map_conf
   gw_write_locations_snippet "$ENABLE_BASICAUTH" "$ENABLE_IPWL" "$IPWL"
-  gw_rewrite_ensure_files
-  gw_rewrite_render_snippet "$DOMAIN"
   gw_write_site_conf "$DOMAIN"
 
   apply_with_rollback "$backup" "$dump" || return 1
@@ -1226,7 +963,7 @@ gw_action_uninstall() {
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
-  trap '[ -n "${dump:-}" ] && rm -f "${dump:-}"' RETURN
+  trap 'rm -f "$dump"' RETURN
 
   rm -f "$enabled" "$conf" "$GW_MAP_CONF" "$GW_SNIP_CONF" "$GW_HTPASSWD" 2>/dev/null || true
   apply_with_rollback "$backup" "$dump" || true
@@ -1248,7 +985,6 @@ gw_menu() {
     echo "2) 查看状态"
     echo "3) 修改 BasicAuth 账号/密码"
     echo "4) 卸载"
-    echo "5) 前后端分离向导（后端地址重写）"
     echo "0) 返回上级"
     echo "=============================="
     read -r -p "请选择: " c
@@ -1257,7 +993,6 @@ gw_menu() {
       2) gw_action_status ;;
       3) gw_action_change_auth ;;
       4) gw_action_uninstall ;;
-      5) frontsplit_guide ;;
       0) return 0 ;;
       *) echo "无效选项" ;;
     esac
@@ -1273,14 +1008,12 @@ main_menu() {
     echo "========== 主菜单 =========="
     echo "1) 单站反代管理器（逐个域名配置）"
     echo "2) 通用反代网关（一个入口反代多个上游）"
-    echo "3) 前后端分离向导（通用网关：后端地址重写）"
     echo "0) 退出"
     echo "============================"
     read -r -p "请选择: " c
     case "$c" in
       1) single_menu ;;
       2) gw_menu ;;
-      3) frontsplit_guide ;;
       0) exit 0 ;;
       *) echo "无效选项" ;;
     esac
