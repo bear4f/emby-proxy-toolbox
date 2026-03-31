@@ -693,7 +693,7 @@ location ~ ^/http/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
 
     # Rewrite redirects back to gateway to prevent client bypass.
     # Many clients require ABSOLUTE Location; we emit https://$host/...
-    proxy_redirect off;
+    # NOTE: 不要同时使用 `proxy_redirect off` 和其他 proxy_redirect 规则，否则会触发“directive is duplicate”。
     proxy_redirect ~^http://([^/]+)(/.*)$  https://$host/http/$1$2;
     proxy_redirect ~^https://([^/]+)(/.*)$ https://$host/https/$1$2;
     proxy_redirect ~^/(.*)$               https://$host/http/$up_target/$1;
@@ -717,8 +717,6 @@ location ~ ^/https/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
     proxy_set_header X-Forwarded-Proto $scheme;
 
     proxy_ssl_server_name on;
-
-    proxy_redirect off;
     proxy_redirect ~^http://([^/]+)(/.*)$  https://$host/http/$1$2;
     proxy_redirect ~^https://([^/]+)(/.*)$ https://$host/https/$1$2;
     proxy_redirect ~^/(.*)$               https://$host/https/$up_target/$1;
@@ -742,8 +740,6 @@ location ~ ^/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
     proxy_set_header X-Forwarded-Proto $scheme;
 
     proxy_ssl_server_name on;
-
-    proxy_redirect off;
     proxy_redirect ~^http://([^/]+)(/.*)$  https://$host/http/$1$2;
     proxy_redirect ~^https://([^/]+)(/.*)$ https://$host/https/$1$2;
     proxy_redirect ~^/(.*)$               https://$host/$up_target/$1;
