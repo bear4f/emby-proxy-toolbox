@@ -17,6 +17,7 @@ GW_PREFIX="emby-gw-"
 GW_MAP_CONF="/etc/nginx/conf.d/emby-gw-map.conf"
 GW_SNIP_CONF="/etc/nginx/snippets/emby-gw-locations.conf"
 GW_HTPASSWD="/etc/nginx/.htpasswd-emby-gw"
+GW_KEY_FILE="/etc/nginx/.emby-gw-key"
 
 TOOL_NAME="emby-proxy-toolbox"
 # ------------------------------------------------
@@ -210,6 +211,12 @@ certbot_enable_tls() {
 }
 
 random_pass() { openssl rand -hex 10 2>/dev/null; }
+random_key() { openssl rand -hex 12 2>/dev/null; }
+
+is_valid_gw_key() {
+  local k="${1:-}"
+  [[ "$k" =~ ^[A-Za-z0-9._-]{8,64}$ ]] || return 1
+}
 
 # ========================= 单站反代 =========================
 single_conf_path_for_domain() { local d="$1"; echo "${SITES_AVAIL}/${SINGLE_PREFIX}$(sanitize_name "$d").conf"; }
@@ -613,14 +620,22 @@ map $up_target $up_host_only {
 EOF
 }
 gw_write_locations_snippet() {
-  local enable_basicauth="$1" enable_ip_whitelist="$2" whitelist_csv="$3"
+  local enable_basicauth="$1" enable_ip_whitelist="$2" whitelist_csv="$3" enable_gw_key="${4:-n}" gw_key="${5:-}"
+  local gw_prefix="" gw_key_mode="disabled"
+
+  if [[ "$enable_gw_key" == "y" ]]; then
+    is_valid_gw_key "$gw_key" || { echo "URL 密钥非法：只允许 8-64 位字母/数字/._-"; return 1; }
+    gw_prefix="/${gw_key}"
+    gw_key_mode="enabled"
+  fi
 
   mkdir -p /etc/nginx/snippets
 
-  # build auth/allow blocks into temp files (no awk; avoids multiline escaping issues)
-  local tmp_auth tmp_allow
+  # build auth/allow/fallback blocks into temp files (no awk; avoids multiline escaping issues)
+  local tmp_auth tmp_allow tmp_fallback
   tmp_auth="$(mktemp)"
   tmp_allow="$(mktemp)"
+  tmp_fallback="$(mktemp)"
 
   # auth block
   if [[ "$enable_basicauth" == "y" ]]; then
@@ -646,9 +661,24 @@ EOF
     : >"$tmp_allow"
   fi
 
+  # fallback block: only enabled in URL-key mode, so wrong/no-key paths are silently dropped.
+  if [[ "$enable_gw_key" == "y" ]]; then
+    cat >"$tmp_fallback" <<'EOF'
+
+# Fallback: any request without the correct URL key is dropped silently.
+location / {
+    return 444;
+}
+EOF
+  else
+    : >"$tmp_fallback"
+  fi
+
   cat > "$GW_SNIP_CONF" <<'EOF'
 # Managed by emby-proxy-toolbox (universal gateway)
 # Included inside server{} (这里不能出现 map 指令)
+# URL key mode: @@GW_KEY_MODE@@
+# URL key prefix: @@GW_PREFIX@@
 
 proxy_http_version 1.1;
 
@@ -671,12 +701,12 @@ resolver 1.1.1.1 8.8.8.8 valid=60s;
 resolver_timeout 5s;
 
 # Normalize (avoid "Location: web/index.html" losing target)
-location ~ ^/http/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)$  { return 301 /http/$up_target/; }
-location ~ ^/https/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)$ { return 301 /https/$up_target/; }
-location ~ ^/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)$       { return 301 /$up_target/; }
+location ~ ^@@GW_PREFIX@@/http/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)$  { return 301 @@GW_PREFIX@@/http/$up_target/; }
+location ~ ^@@GW_PREFIX@@/https/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)$ { return 301 @@GW_PREFIX@@/https/$up_target/; }
+location ~ ^@@GW_PREFIX@@/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)$       { return 301 @@GW_PREFIX@@/$up_target/; }
 
-# /http/<target>/...
-location ~ ^/http/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
+# @@GW_PREFIX@@/http/<target>/...
+location ~ ^@@GW_PREFIX@@/http/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
     set $up_scheme http;
     if ($up_rest = "") { set $up_rest "/"; }
 
@@ -694,16 +724,16 @@ location ~ ^/http/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
     # Rewrite redirects back to gateway to prevent client bypass.
     # Many clients require ABSOLUTE Location; we emit https://$host/...
     # NOTE: 不要同时使用 `proxy_redirect off` 和其他 proxy_redirect 规则，否则会触发“directive is duplicate”。
-    proxy_redirect ~^http://([^/]+)(/.*)$  https://$host/http/$1$2;
-    proxy_redirect ~^https://([^/]+)(/.*)$ https://$host/https/$1$2;
-    proxy_redirect ~^/(.*)$               https://$host/http/$up_target/$1;
-    proxy_redirect ~^([^/].*)$            https://$host/http/$up_target/$1;
+    proxy_redirect ~^http://([^/]+)(/.*)$  https://$host@@GW_PREFIX@@/http/$1$2;
+    proxy_redirect ~^https://([^/]+)(/.*)$ https://$host@@GW_PREFIX@@/https/$1$2;
+    proxy_redirect ~^/(.*)$               https://$host@@GW_PREFIX@@/http/$up_target/$1;
+    proxy_redirect ~^([^/].*)$            https://$host@@GW_PREFIX@@/http/$up_target/$1;
 
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
 
-# /https/<target>/...
-location ~ ^/https/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
+# @@GW_PREFIX@@/https/<target>/...
+location ~ ^@@GW_PREFIX@@/https/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
     set $up_scheme https;
     if ($up_rest = "") { set $up_rest "/"; }
 
@@ -717,16 +747,16 @@ location ~ ^/https/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
     proxy_set_header X-Forwarded-Proto $scheme;
 
     proxy_ssl_server_name on;
-    proxy_redirect ~^http://([^/]+)(/.*)$  https://$host/http/$1$2;
-    proxy_redirect ~^https://([^/]+)(/.*)$ https://$host/https/$1$2;
-    proxy_redirect ~^/(.*)$               https://$host/https/$up_target/$1;
-    proxy_redirect ~^([^/].*)$            https://$host/https/$up_target/$1;
+    proxy_redirect ~^http://([^/]+)(/.*)$  https://$host@@GW_PREFIX@@/http/$1$2;
+    proxy_redirect ~^https://([^/]+)(/.*)$ https://$host@@GW_PREFIX@@/https/$1$2;
+    proxy_redirect ~^/(.*)$               https://$host@@GW_PREFIX@@/https/$up_target/$1;
+    proxy_redirect ~^([^/].*)$            https://$host@@GW_PREFIX@@/https/$up_target/$1;
 
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
 
-# Default: /<target>/... (scheme defaults to https)
-location ~ ^/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
+# Default: @@GW_PREFIX@@/<target>/... (scheme defaults to https)
+location ~ ^@@GW_PREFIX@@/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
     set $up_scheme https;
     if ($up_rest = "") { set $up_rest "/"; }
 
@@ -740,13 +770,15 @@ location ~ ^/(?<up_target>[A-Za-z0-9.\-_\[\]:]+)(?<up_rest>/.*)?$ {
     proxy_set_header X-Forwarded-Proto $scheme;
 
     proxy_ssl_server_name on;
-    proxy_redirect ~^http://([^/]+)(/.*)$  https://$host/http/$1$2;
-    proxy_redirect ~^https://([^/]+)(/.*)$ https://$host/https/$1$2;
-    proxy_redirect ~^/(.*)$               https://$host/$up_target/$1;
-    proxy_redirect ~^([^/].*)$            https://$host/$up_target/$1;
+    proxy_redirect ~^http://([^/]+)(/.*)$  https://$host@@GW_PREFIX@@/http/$1$2;
+    proxy_redirect ~^https://([^/]+)(/.*)$ https://$host@@GW_PREFIX@@/https/$1$2;
+    proxy_redirect ~^/(.*)$               https://$host@@GW_PREFIX@@/$up_target/$1;
+    proxy_redirect ~^([^/].*)$            https://$host@@GW_PREFIX@@/$up_target/$1;
 
     proxy_pass $up_scheme://$up_target$up_rest$is_args$args;
 }
+
+#@@FALLBACK@@
 EOF
 
   # Insert blocks (multiline safe)
@@ -760,19 +792,43 @@ EOF
   fi
   sed -i "/^#@@ALLOW@@/d" "$GW_SNIP_CONF"
 
-  rm -f "$tmp_auth" "$tmp_allow"
+  if [[ -s "$tmp_fallback" ]]; then
+    sed -i "/^#@@FALLBACK@@/r $tmp_fallback" "$GW_SNIP_CONF"
+  fi
+  sed -i "/^#@@FALLBACK@@/d" "$GW_SNIP_CONF"
+
+  sed -i "s|@@GW_KEY_MODE@@|${gw_key_mode}|g" "$GW_SNIP_CONF"
+  sed -i "s|@@GW_PREFIX@@|${gw_prefix}|g" "$GW_SNIP_CONF"
+
+  rm -f "$tmp_auth" "$tmp_allow" "$tmp_fallback"
 }
 
-
 gw_write_site_conf() {
-  local domain="$1"
-  local conf enabled
+  local domain="$1" enable_gw_key="${2:-n}" gw_key="${3:-}"
+  local conf enabled root_location usage_hint
   conf="$(gw_conf_path_for_domain "$domain")"
   enabled="$(gw_enabled_path_for_domain "$domain")"
+
+  if [[ "$enable_gw_key" == "y" ]]; then
+    is_valid_gw_key "$gw_key" || { echo "URL 密钥非法：只允许 8-64 位字母/数字/._-"; return 1; }
+    root_location='  location = / { return 444; }'
+    usage_hint="# URL key enabled. Client URL example: https://${domain}/${gw_key}/<upstream-host:port>"
+  else
+    root_location=$(cat <<EOF_ROOT
+  location = / {
+    default_type text/plain;
+    return 200 "OK\\n\\n通用反代网关使用方式（填写到 Emby 客户端“服务器地址”）：\\n\\n  https://${domain}/<上游主机:端口>\\n  https://${domain}/http/<上游主机:端口>\\n\\n说明：默认按 https 回源；若需要 http 回源用 /http 前缀。\\n\\n安全提示：建议开启 URL 密钥、BasicAuth 或 IP 白名单，避免 OPEN PROXY。\\n";
+  }
+EOF_ROOT
+)
+    usage_hint="# URL key disabled. Client URL example: https://${domain}/<upstream-host:port>"
+  fi
 
   cat >"$conf" <<EOF
 # ${TOOL_NAME} / 通用反代网关：${domain}
 # Managed by ${TOOL_NAME}
+# META domain=${domain} url_key=${enable_gw_key}
+${usage_hint}
 
 server {
   listen 80;
@@ -784,10 +840,7 @@ server {
     try_files \$uri =404;
   }
 
-  location = / {
-    default_type text/plain;
-    return 200 "OK\\n\\n通用反代网关使用方式（填写到 Emby 客户端“服务器地址”）：\\n\\n  https://${domain}/<上游主机:端口>\\n  https://${domain}/http/<上游主机:端口>\\n\\n说明：默认按 https 回源；若需要 http 回源用 /http 前缀。\\n\\n安全提示：建议开启 BasicAuth 或 IP 白名单，避免 OPEN PROXY。\\n";
-  }
+${root_location}
 
   include /etc/nginx/snippets/emby-gw-locations.conf;
 }
@@ -798,17 +851,29 @@ EOF
 }
 
 gw_print_usage() {
-  local domain="$1" ssl="$2" user="${3:-}" pass="${4:-}"
+  local domain="$1" ssl="$2" enable_gw_key="${3:-n}" gw_key="${4:-}" user="${5:-}" pass="${6:-}"
   local base="http://${domain}"; [[ "$ssl" == "y" ]] && base="https://${domain}"
+  local key_prefix=""
+  [[ "$enable_gw_key" == "y" ]] && key_prefix="/${gw_key}"
+
   echo
   echo "================ 通用网关用法 ================"
   echo "在 Emby 客户端服务器地址中填写："
-  echo "  ${base}/<上游主机:端口>        （默认按 https 回源）"
-  echo "  ${base}/http/<上游主机:端口>   （强制 http 回源）"
+  echo "  ${base}${key_prefix}/<上游主机:端口>        （默认按 https 回源）"
+  echo "  ${base}${key_prefix}/http/<上游主机:端口>   （强制 http 回源）"
   echo
   echo "示例（仅示意，非真实地址）："
-  echo "  ${base}/example.com:443"
-  echo "  ${base}/http/203.0.113.10:8096"
+  echo "  ${base}${key_prefix}/example.com:443"
+  echo "  ${base}${key_prefix}/http/203.0.113.10:8096"
+  echo
+  if [[ "$enable_gw_key" == "y" ]]; then
+    echo "已开启 URL 密钥前缀："
+    echo "  密钥: $gw_key"
+    echo "  没有这个路径前缀的请求会直接 444 断开。"
+    echo "  注意：密钥会出现在客户端 URL 和 Nginx access log 中，泄露后请重新安装/更新并换新密钥。"
+  else
+    echo "未开启 URL 密钥前缀。"
+  fi
   echo
   if [[ -n "$user" ]]; then
     echo "已开启 BasicAuth（网关额外门禁；不影响上游 Emby 自身账号密码）："
@@ -823,7 +888,7 @@ gw_print_usage() {
 }
 
 gw_action_install_update() {
-  local DOMAIN ENABLE_SSL EMAIL ENABLE_BASICAUTH BASIC_USER BASIC_PASS ENABLE_IPWL IPWL ok
+  local DOMAIN ENABLE_SSL EMAIL ENABLE_GW_KEY GW_KEY ENABLE_BASICAUTH BASIC_USER BASIC_PASS ENABLE_IPWL IPWL ok def_basic
   prompt DOMAIN "你的网关入口域名（例如 autoemby.example.com；只填域名，不要 https://）"
   DOMAIN="$(strip_scheme "$DOMAIN")"
   [[ -n "$DOMAIN" ]] || { echo "域名不能为空"; return 1; }
@@ -832,7 +897,17 @@ gw_action_install_update() {
   EMAIL="admin@${DOMAIN}"
   [[ "$ENABLE_SSL" == "y" ]] && prompt EMAIL "证书邮箱" "$EMAIL"
 
-  yesno ENABLE_BASICAUTH "启用 BasicAuth（强烈建议；但注意部分客户端不支持）" "y"
+  yesno ENABLE_GW_KEY "启用 URL 密钥前缀（推荐；兼容不支持 BasicAuth 的客户端）" "y"
+  GW_KEY=""
+  if [[ "$ENABLE_GW_KEY" == "y" ]]; then
+    GW_KEY="$(random_key)"
+    prompt GW_KEY "URL 密钥（直接回车=自动生成；8-64 位字母/数字/._-）" "$GW_KEY"
+    is_valid_gw_key "$GW_KEY" || { echo "URL 密钥非法：只允许 8-64 位字母/数字/._-"; return 1; }
+  fi
+
+  def_basic="y"
+  [[ "$ENABLE_GW_KEY" == "y" ]] && def_basic="n"
+  yesno ENABLE_BASICAUTH "启用 BasicAuth（更安全；但注意部分客户端不支持）" "$def_basic"
   BASIC_USER="emby"; BASIC_PASS=""
   if [[ "$ENABLE_BASICAUTH" == "y" ]]; then
     prompt BASIC_USER "BasicAuth 用户名" "emby"
@@ -840,15 +915,15 @@ gw_action_install_update() {
     prompt BASIC_PASS "BasicAuth 密码（直接回车=自动生成）" "$BASIC_PASS"
   fi
 
-  yesno ENABLE_IPWL "启用 IP 白名单（可选）" "n"
+  yesno ENABLE_IPWL "启用 IP 白名单（可选，最稳；IP 固定时推荐）" "n"
   IPWL=""
   if [[ "$ENABLE_IPWL" == "y" ]]; then
     prompt IPWL "白名单（逗号分隔，例如 1.2.3.4/32,5.6.7.8/32）"
     [[ -n "$IPWL" ]] || { echo "白名单不能为空"; return 1; }
   fi
 
-  if [[ "$ENABLE_BASICAUTH" == "n" && "$ENABLE_IPWL" == "n" ]]; then
-    echo "⚠️ 警告：你同时关闭了 BasicAuth 和 IP 白名单，这会把网关变成 OPEN PROXY（高风险）。"
+  if [[ "$ENABLE_GW_KEY" == "n" && "$ENABLE_BASICAUTH" == "n" && "$ENABLE_IPWL" == "n" ]]; then
+    echo "⚠️ 警告：你同时关闭了 URL 密钥、BasicAuth 和 IP 白名单，这会把网关变成 OPEN PROXY（高风险）。"
     yesno ok "仍要继续安装吗" "n"
     [[ "$ok" == "y" ]] || { echo "已取消"; return 0; }
   fi
@@ -857,6 +932,8 @@ gw_action_install_update() {
   echo "---- 配置确认 ----"
   echo "入口域名:   $DOMAIN"
   echo "网关 HTTPS: $ENABLE_SSL"
+  echo "URL 密钥:   $ENABLE_GW_KEY"
+  [[ "$ENABLE_GW_KEY" == "y" ]] && echo "密钥值:     $GW_KEY"
   echo "BasicAuth:  $ENABLE_BASICAUTH"
   echo "IP 白名单:  $ENABLE_IPWL"
   echo "------------------"
@@ -871,14 +948,21 @@ gw_action_install_update() {
     htpasswd -bc "$GW_HTPASSWD" "$BASIC_USER" "$BASIC_PASS" >/dev/null
   fi
 
+  if [[ "$ENABLE_GW_KEY" == "y" ]]; then
+    printf '%s\n' "$GW_KEY" > "$GW_KEY_FILE"
+    chmod 600 "$GW_KEY_FILE" || true
+  else
+    rm -f "$GW_KEY_FILE" >/dev/null 2>&1 || true
+  fi
+
   local backup dump
   backup="$(backup_nginx)"
   dump="$(mktemp)"
   trap 'rm -f "$dump"' RETURN
 
   gw_write_map_conf
-  gw_write_locations_snippet "$ENABLE_BASICAUTH" "$ENABLE_IPWL" "$IPWL"
-  gw_write_site_conf "$DOMAIN"
+  gw_write_locations_snippet "$ENABLE_BASICAUTH" "$ENABLE_IPWL" "$IPWL" "$ENABLE_GW_KEY" "$GW_KEY"
+  gw_write_site_conf "$DOMAIN" "$ENABLE_GW_KEY" "$GW_KEY"
 
   apply_with_rollback "$backup" "$dump" || return 1
 
@@ -899,7 +983,11 @@ gw_action_install_update() {
   echo "✅ 网关已生效：$DOMAIN"
   echo "站点配置：$(gw_conf_path_for_domain "$DOMAIN")"
   echo "备份目录：$backup"
-  if [[ "$ENABLE_BASICAUTH" == "y" ]]; then gw_print_usage "$DOMAIN" "$ENABLE_SSL" "$BASIC_USER" "$BASIC_PASS"; else gw_print_usage "$DOMAIN" "$ENABLE_SSL"; fi
+  if [[ "$ENABLE_BASICAUTH" == "y" ]]; then
+    gw_print_usage "$DOMAIN" "$ENABLE_SSL" "$ENABLE_GW_KEY" "$GW_KEY" "$BASIC_USER" "$BASIC_PASS"
+  else
+    gw_print_usage "$DOMAIN" "$ENABLE_SSL" "$ENABLE_GW_KEY" "$GW_KEY"
+  fi
 }
 
 gw_action_status() {
@@ -912,6 +1000,11 @@ gw_action_status() {
   echo
   [[ -f "$GW_MAP_CONF" ]] && echo "Map 文件：$GW_MAP_CONF（存在）" || echo "Map 文件：$GW_MAP_CONF（缺失）"
   [[ -f "$GW_SNIP_CONF" ]] && echo "Snippet： $GW_SNIP_CONF（存在）" || echo "Snippet： $GW_SNIP_CONF（缺失）"
+  if [[ -f "$GW_KEY_FILE" ]]; then
+    echo "URL密钥：  $GW_KEY_FILE（存在，当前密钥：$(cat "$GW_KEY_FILE" 2>/dev/null || echo unknown)）"
+  else
+    echo "URL密钥：  $GW_KEY_FILE（缺失/未启用）"
+  fi
   [[ -f "$GW_HTPASSWD" ]] && echo "BasicAuth：$GW_HTPASSWD（存在）" || echo "BasicAuth：$GW_HTPASSWD（缺失/未启用）"
 }
 
@@ -948,6 +1041,7 @@ gw_action_uninstall() {
   echo "  $GW_MAP_CONF"
   echo "  $GW_SNIP_CONF"
   echo "  $GW_HTPASSWD"
+  echo "  $GW_KEY_FILE"
   echo
   yesno ok "确认卸载" "n"
   [[ "$ok" == "y" ]] || { echo "已取消"; return 0; }
@@ -961,7 +1055,7 @@ gw_action_uninstall() {
   dump="$(mktemp)"
   trap 'rm -f "$dump"' RETURN
 
-  rm -f "$enabled" "$conf" "$GW_MAP_CONF" "$GW_SNIP_CONF" "$GW_HTPASSWD" 2>/dev/null || true
+  rm -f "$enabled" "$conf" "$GW_MAP_CONF" "$GW_SNIP_CONF" "$GW_HTPASSWD" "$GW_KEY_FILE" 2>/dev/null || true
   apply_with_rollback "$backup" "$dump" || true
 
   echo "✅ 已卸载网关。备份目录：$backup"
@@ -973,7 +1067,7 @@ gw_menu() {
   echo
   echo "=== 通用反代网关 ==="
   echo "系统：${OS_NAME} / ${OS_VER} / ${OS_CODE}"
-  echo "提示：强烈建议开启 BasicAuth 或 IP 白名单，避免 OPEN PROXY。"
+  echo "提示：强烈建议开启 URL 密钥、BasicAuth 或 IP 白名单，避免 OPEN PROXY。"
   echo
   while true; do
     echo "========== 网关菜单 =========="
